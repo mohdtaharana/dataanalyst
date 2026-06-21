@@ -635,6 +635,48 @@ app.post('/api/datasets/:id/chat', async (c) => {
   
   const history = chatHistories.get(id) || []
   
+  const msgLower = message.toLowerCase().trim()
+  
+  // Detect if user is asking for a list/table of the data/rows/records/dataset
+  const isAskingForTable = 
+    (msgLower.includes('list') || msgLower.includes('show') || msgLower.includes('table') || msgLower.includes('display') || msgLower.includes('print') || msgLower.includes('get') || msgLower.includes('view') || msgLower.includes('give me')) &&
+    (msgLower.includes('data') || msgLower.includes('row') || msgLower.includes('record') || msgLower.includes('dataset') || msgLower.includes('file') || msgLower.includes('all') || msgLower.includes('entire') || msgLower.includes('list') || msgLower.includes('rows') || dataset.headers.some((h: string) => msgLower.includes(h.toLowerCase())));
+    
+  if (isAskingForTable) {
+    let targetHeaders = dataset.headers
+    let targetRows = dataset.rows
+    
+    // Check if user is asking for specific columns
+    const columnMatches = dataset.headers.filter((h: string) => msgLower.includes(h.toLowerCase()))
+    if (columnMatches.length > 0) {
+      targetHeaders = columnMatches
+      const indices = columnMatches.map((h: string) => dataset.headers.indexOf(h))
+      targetRows = dataset.rows.map((row: any[]) => indices.map(idx => row[idx]))
+    }
+    
+    let limit = dataset.rows.length
+    const limitMatch = msgLower.match(/\b(\d+)\s*(?:rows|records|items|entries|lines|values|names)?\b/) || msgLower.match(/(?:first|top|show|limit)\s*(\d+)\b/)
+    if (limitMatch) {
+      limit = parseInt(limitMatch[1], 10)
+    }
+    
+    const slicedRows = targetRows.slice(0, limit)
+    const colStr = columnMatches.length > 0 ? `for column(s) ${columnMatches.join(', ')}` : ''
+    const responseText = `Here is the requested table ${colStr} containing ${slicedRows.length} rows (out of ${dataset.rows.length} total rows). You can search and filter the records using the search box below:`
+    
+    history.push({ role: 'user', content: message })
+    history.push({ role: 'assistant', content: responseText })
+    chatHistories.set(id, history.slice(-20))
+    
+    return c.json({
+      response: responseText,
+      tableData: {
+        headers: targetHeaders,
+        rows: slicedRows
+      }
+    })
+  }
+  
   const context = `
 Dataset: ${dataset.fileName} (${dataset.rowCount} rows, ${dataset.columnCount} columns)
 Columns: ${dataset.columnAnalysis.map((c: any) => `${c.name} (${c.dataType}, ${c.uniqueValues} unique values)`).join(', ')}
@@ -1203,6 +1245,49 @@ function getAppCSS(): string {
 
 function getAppJS(): string {
   return `
+// ============ HELPERS ============
+function parseMarkdownTables(text) {
+  if (!text) return ''
+  const tableRegex = /((?:^\\|.+\\|\\s*\\r?\\n)+)/gm
+  return text.replace(tableRegex, (match) => {
+    const lines = match.trim().split(/\\r?\\n/)
+    if (lines.length < 2) return match
+    const isSeparator = /^\\|(?:\\s*:?-+:?\\s*\\|)+$/.test(lines[1].trim())
+    const startIdx = isSeparator ? 2 : 1
+    
+    const parseCells = (line) => {
+      return line.split('|').map(s => s.trim()).slice(1, -1)
+    }
+    
+    const headers = parseCells(lines[0])
+    if (headers.length === 0) return match
+    
+    let html = '<div class="overflow-x-auto my-3 rounded-xl border border-white/10 bg-dark-950/40">'
+    html += '<table class="min-w-full divide-y divide-white/10 text-xs text-left">'
+    html += '<thead class="bg-white/5 text-dark-200 font-medium uppercase tracking-wider">'
+    html += '<tr>'
+    headers.forEach(h => {
+      html += '<th class="px-3 py-2 whitespace-nowrap">' + h + '</th>'
+    })
+    html += '</tr>'
+    html += '</thead>'
+    html += '<tbody class="divide-y divide-white/5 text-dark-200">'
+    for (let i = startIdx; i < lines.length; i++) {
+      const cells = parseCells(lines[i])
+      if (cells.length === 0) continue
+      html += '<tr class="hover:bg-white/5 transition-colors">'
+      cells.forEach(c => {
+        html += '<td class="px-3 py-2 whitespace-nowrap">' + c + '</td>'
+      })
+      html += '</tr>'
+    }
+    html += '</tbody>'
+    html += '</table></div>'
+    
+    return html
+  })
+}
+
 // ============ AI DATA SCIENTIST - MAIN APPLICATION ============
 const App = {
   state: {
@@ -1222,7 +1307,8 @@ const App = {
     theme: 'dark',
     sidebarOpen: true,
     filters: [],
-    filteredRows: null
+    filteredRows: null,
+    tableStates: {}
   },
 
   init() {
@@ -1368,7 +1454,11 @@ const App = {
       if (!res.ok || data.error) {
         this.state.chatMessages.push({ role: 'assistant', content: 'Error: ' + (data.error || 'Server error. Please try again.') })
       } else {
-        this.state.chatMessages.push({ role: 'assistant', content: data.response || 'The AI returned an empty response. Please try again.' })
+        this.state.chatMessages.push({ 
+          role: 'assistant', 
+          content: data.response || 'The AI returned an empty response. Please try again.',
+          tableData: data.tableData
+        })
       }
       this.render()
       setTimeout(() => { const c = document.getElementById('chat-messages'); if (c) c.scrollTop = c.scrollHeight }, 100)
@@ -1377,6 +1467,21 @@ const App = {
       this.state.chatMessages.push({ role: 'assistant', content: 'Network error. Please check your connection and try again.' })
       this.render()
     }
+  },
+
+  searchTable(tableId, query) {
+    this.state.tableStates = this.state.tableStates || {}
+    this.state.tableStates[tableId] = this.state.tableStates[tableId] || { page: 1, search: '', pageSize: 5 }
+    this.state.tableStates[tableId].search = query
+    this.state.tableStates[tableId].page = 1
+    this.render()
+  },
+  
+  setTablePage(tableId, page) {
+    this.state.tableStates = this.state.tableStates || {}
+    this.state.tableStates[tableId] = this.state.tableStates[tableId] || { page: 1, search: '', pageSize: 5 }
+    this.state.tableStates[tableId].page = page
+    this.render()
   },
 
   showToast(message, type = 'info') {
@@ -2481,8 +2586,9 @@ const App = {
 
   formatChatMessage(text) {
     if (!text) return ''
+    let formatted = parseMarkdownTables(text)
     const bullet = String.fromCharCode(8226)
-    return text
+    return formatted
       .replace(/\\*\\*\\*(.*?)\\*\\*\\*/g, '$1') // bold-italic
       .replace(/\\*\\*(.*?)\\*\\*/g, '$1')     // bold
       .replace(/\\*(.*?)\\*/g, '$1')       // italic
@@ -2542,6 +2648,9 @@ const App = {
           \${msgs.map((msg, idx) => {
             const isUser = msg.role === 'user'
             const cleanContent = isUser ? msg.content : this.formatChatMessage(msg.content)
+            const hasTable = !isUser && msg.tableData
+            const tableId = \`chat-table-\${idx}\`
+            const tableHtml = hasTable ? this.renderChatTable(msg.tableData, tableId) : ''
             return \`
             <div class="flex \${isUser ? 'justify-end' : 'justify-start'} items-end gap-2.5">
               \${!isUser ? \`
@@ -2556,6 +2665,7 @@ const App = {
                   <span class="text-[10px] font-semibold text-primary-400 uppercase tracking-wider block mb-1.5">AI Data Scientist</span>
                 \` : ''}
                 <p class="text-sm leading-relaxed \${isUser ? 'text-white' : 'text-dark-200'} whitespace-pre-wrap">\${cleanContent}</p>
+                \${tableHtml}
               </div>
               \${isUser ? \`
                 <div class="w-8 h-8 rounded-xl bg-dark-700 border border-white/10 flex items-center justify-center flex-shrink-0">
@@ -2598,6 +2708,94 @@ const App = {
         <p class="text-center text-[10px] text-dark-600 mt-2">AI responses are based on your uploaded dataset only</p>
       </div>
     </div>\`
+  },
+
+  renderChatTable(tableData, tableId) {
+    if (!tableData || !tableData.headers || !tableData.rows) return ''
+    
+    this.state.tableStates = this.state.tableStates || {}
+    const tState = this.state.tableStates[tableId] || { page: 1, search: '', pageSize: 5 }
+    this.state.tableStates[tableId] = tState
+    
+    const searchQuery = tState.search.toLowerCase().trim()
+    const filteredRows = searchQuery === '' 
+      ? tableData.rows 
+      : tableData.rows.filter(row => 
+          row.some(val => String(val).toLowerCase().includes(searchQuery))
+        )
+        
+    const totalRows = filteredRows.length
+    const totalPages = Math.max(1, Math.ceil(totalRows / tState.pageSize))
+    
+    if (tState.page > totalPages) tState.page = totalPages
+    if (tState.page < 1) tState.page = 1
+    
+    const startIdx = (tState.page - 1) * tState.pageSize
+    const slicedRows = filteredRows.slice(startIdx, startIdx + tState.pageSize)
+    
+    let html = '<div class="mt-3 rounded-xl border border-white/10 bg-dark-950/40 p-3 space-y-3">'
+    
+    // Search header
+    html += '<div class="flex items-center justify-between gap-2 flex-wrap">'
+    html += '<div class="relative flex-1 min-w-[120px]">'
+    html += '<i class="fas fa-search absolute left-2.5 top-1/2 -translate-y-1/2 text-dark-400 text-[10px]"></i>'
+    html += '<input type="text" placeholder="Search table..." value="' + tState.search + '" '
+    html += 'oninput="App.searchTable(\\\'' + tableId + '\\\', this.value)" '
+    html += 'class="w-full bg-dark-900/60 border border-white/5 rounded-lg pl-7 pr-2 py-1 text-[10px] text-white placeholder-dark-500 focus:outline-none focus:border-primary-500 transition-all" />'
+    html += '</div>'
+    html += '<span class="text-[9px] text-dark-400 whitespace-nowrap bg-white/5 px-2 py-0.5 rounded">' + totalRows + ' rows</span>'
+    html += '</div>'
+    
+    // Table
+    html += '<div class="overflow-x-auto rounded-lg border border-white/5 bg-dark-900/40 max-h-60 overflow-y-auto">'
+    html += '<table class="min-w-full divide-y divide-white/5 text-[10px] text-left">'
+    html += '<thead class="bg-white/5 text-dark-300 font-medium uppercase tracking-wider sticky top-0 backdrop-blur-md">'
+    html += '<tr>'
+    tableData.headers.forEach(h => {
+      html += '<th class="px-2 py-1.5 whitespace-nowrap">' + h + '</th>'
+    })
+    html += '</tr>'
+    html += '</thead>'
+    
+    html += '<tbody class="divide-y divide-white/5 text-dark-200">'
+    if (slicedRows.length === 0) {
+      html += '<tr><td colspan="' + tableData.headers.length + '" class="px-2 py-3 text-center text-dark-400 italic">No matching records found.</td></tr>'
+    } else {
+      slicedRows.forEach(row => {
+        html += '<tr class="hover:bg-white/5 transition-colors">'
+        row.forEach(val => {
+          const displayVal = val === null || val === undefined ? '' : val
+          html += '<td class="px-2 py-1 whitespace-nowrap">' + displayVal + '</td>'
+        })
+        html += '</tr>'
+      })
+    }
+    html += '</tbody>'
+    html += '</table>'
+    html += '</div>'
+    
+    // Pagination footer
+    html += '<div class="flex items-center justify-between text-[10px] text-dark-400 pt-1">'
+    html += '<span>Page ' + tState.page + ' of ' + totalPages + '</span>'
+    html += '<div class="flex items-center gap-1">'
+    
+    const prevDisabled = tState.page === 1 ? 'disabled' : ''
+    html += '<button onclick="App.setTablePage(\\\'' + tableId + '\\\', ' + (tState.page - 1) + ')" ' + prevDisabled + ' '
+    html += 'class="px-1.5 py-0.5 rounded bg-white/5 border border-white/5 hover:bg-white/10 hover:text-white disabled:opacity-30 disabled:pointer-events-none transition-all">'
+    html += '<i class="fas fa-chevron-left text-[8px]"></i>'
+    html += '</button>'
+    
+    const nextDisabled = tState.page === totalPages ? 'disabled' : ''
+    html += '<button onclick="App.setTablePage(\\\'' + tableId + '\\\', ' + (tState.page + 1) + ')" ' + nextDisabled + ' '
+    html += 'class="px-1.5 py-0.5 rounded bg-white/5 border border-white/5 hover:bg-white/10 hover:text-white disabled:opacity-30 disabled:pointer-events-none transition-all">'
+    html += '<i class="fas fa-chevron-right text-[8px]"></i>'
+    html += '</button>'
+    
+    html += '</div>'
+    html += '</div>'
+    html += '</div>'
+    
+    return html
   },
 
   renderForecast() {
