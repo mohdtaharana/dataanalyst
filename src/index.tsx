@@ -18,6 +18,32 @@ const datasets: Map<string, any> = new Map()
 const analyses: Map<string, any> = new Map()
 const chatHistories: Map<string, any[]> = new Map()
 
+function getApiKey(env: Bindings | undefined): string | undefined {
+  if (env?.POOLSIDE_API_KEY) return env.POOLSIDE_API_KEY
+  
+  // Try reading the local API key injected by Vite
+  try {
+    const local = (typeof process !== 'undefined') ? (process as any).env?.LOCAL_POOLSIDE_API_KEY : undefined
+    if (local) return local
+  } catch {}
+
+  // Fallback to process.env.POOLSIDE_API_KEY
+  try {
+    const p = (typeof process !== 'undefined') ? (process as any).env?.POOLSIDE_API_KEY : undefined
+    if (p) return p
+  } catch {}
+  
+  // Fallback to direct fs read (only if running in pure Node.js)
+  try {
+    const fs = (globalThis as any).require?.('fs') || require('fs')
+    const raw = fs.readFileSync('.dev.vars', 'utf8')
+    const match = raw.match(/POOLSIDE_API_KEY=(.+)/)
+    if (match?.[1]) return match[1].trim()
+  } catch {}
+  
+  return undefined
+}
+
 // ============ UTILITY FUNCTIONS ============
 function generateId(): string {
   return crypto.randomUUID()
@@ -554,8 +580,8 @@ app.post('/api/datasets/:id/insights', async (c) => {
   const id = c.req.param('id')
   const dataset = datasets.get(id)
   if (!dataset) return c.json({ error: 'Dataset not found' }, 404)
-  const apiKey = c.env?.POOLSIDE_API_KEY || (typeof process !== 'undefined' ? (process as any).env?.POOLSIDE_API_KEY : undefined)
-  if (!apiKey) return c.json({ error: 'POOLSIDE_API_KEY is not configured. Add it to .dev.vars for local dev.' }, 500)
+  const apiKey = getApiKey(c.env)
+  if (!apiKey) return c.json({ error: 'POOLSIDE_API_KEY not found. Set it in .dev.vars for local dev.' }, 500)
   
   const context = `
 Dataset: ${dataset.fileName}
@@ -604,8 +630,8 @@ app.post('/api/datasets/:id/chat', async (c) => {
   const body = await c.req.json()
   const { message } = body
   if (!message || !String(message).trim()) return c.json({ error: 'Message is required.' }, 400)
-  const apiKey = c.env?.POOLSIDE_API_KEY || (typeof process !== 'undefined' ? (process as any).env?.POOLSIDE_API_KEY : undefined)
-  if (!apiKey) return c.json({ error: 'POOLSIDE_API_KEY is not configured. Add it to .dev.vars for local dev.' }, 500)
+  const apiKey = getApiKey(c.env)
+  if (!apiKey) return c.json({ error: 'POOLSIDE_API_KEY not found. Set it in .dev.vars for local dev.' }, 500)
   
   const history = chatHistories.get(id) || []
   

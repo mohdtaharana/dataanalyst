@@ -7,7 +7,8 @@ module.exports = {
       cwd: './',
       env: {
         NODE_ENV: 'development',
-        PORT: 3000
+        PORT: 3000,
+        POOLSIDE_API_KEY: process.env.POOLSIDE_API_KEY || require('fs').readFileSync('.dev.vars','utf8').match(/POOLSIDE_API_KEY=(.+)/)?.[1]?.trim() || ''
       },
       watch: false,
       instances: 1,
