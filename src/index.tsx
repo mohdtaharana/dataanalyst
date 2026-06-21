@@ -925,108 +925,331 @@ app.get('/api/datasets/:id/cleaning', async (c) => {
   })
 })
 
-// Clean dataset
+// Clean dataset — comprehensive production-grade pipeline
 app.post('/api/datasets/:id/clean', async (c) => {
   const id = c.req.param('id')
   const dataset = datasets.get(id)
   if (!dataset) return c.json({ error: 'Dataset not found' }, 404)
-  
+
   const { headers, rows, columnAnalysis } = dataset
-  
-  // 1. Remove duplicate rows
-  const rowStrings = rows.map((r: any) => JSON.stringify(r))
-  const uniqueRowIndices: number[] = []
-  const seenRows = new Set<string>()
-  
-  rowStrings.forEach((rStr: string, idx: number) => {
-    if (!seenRows.has(rStr)) {
-      seenRows.add(rStr)
-      uniqueRowIndices.push(idx)
+
+  // ─────────────────────────────────────────────────────────────
+  // HELPERS
+  // ─────────────────────────────────────────────────────────────
+
+  /** Parse a messy price/number string → clean float or NaN */
+  function parseNumber(v: any): number {
+    if (v === null || v === undefined || v === '') return NaN
+    const s = String(v).trim()
+      .replace(/[Rr][Ss]\.?/g, '')   // strip Rs / Rs.
+      .replace(/,/g, '')              // strip commas  11,712 → 11712
+      .replace(/\$/g, '')             // strip $
+      .replace(/[^\d.\-]/g, '')       // strip anything else except digit/dot/minus
+    return parseFloat(s)
+  }
+
+  /** Normalise text: trim + title-case first letter per word */
+  function toTitleCase(s: string): string {
+    return s.trim()
+      .toLowerCase()
+      .replace(/\b\w/g, (c: string) => c.toUpperCase())
+  }
+
+  /** Normalise boolean representations → 'Yes' | 'No' */
+  function normaliseBool(v: any): string | null {
+    const s = String(v).trim().toLowerCase()
+    if (['1', 'true', 'yes', 'y'].includes(s)) return 'Yes'
+    if (['0', 'false', 'no', 'n'].includes(s)) return 'No'
+    return null
+  }
+
+  const MONTHS_SHORT: Record<string, string> = {
+    jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',
+    jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'
+  }
+
+  /** Parse a messy date string → 'YYYY-MM-DD' or null */
+  function parseDate(v: any): string | null {
+    if (!v) return null
+    const s = String(v).trim()
+    // Already ISO
+    let m = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/)
+    if (m) {
+      const [, y, mo, d] = m
+      if (+mo < 1 || +mo > 12 || +d < 1 || +d > 31) return null
+      return `${y}-${mo.padStart(2,'0')}-${d.padStart(2,'0')}`
+    }
+    // DD/MM/YYYY or DD-MM-YYYY
+    m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/)
+    if (m) {
+      const [, d, mo, y] = m
+      if (+mo < 1 || +mo > 12 || +d < 1 || +d > 31) return null
+      return `${y}-${mo.padStart(2,'0')}-${d.padStart(2,'0')}`
+    }
+    // MM-Mon-YYYY  e.g. 10-May-2024
+    m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/)
+    if (m) {
+      const [, d, monStr, y] = m
+      const mo = MONTHS_SHORT[monStr.toLowerCase()]
+      if (!mo || +d < 1 || +d > 31) return null
+      return `${y}-${mo}-${d.padStart(2,'0')}`
+    }
+    // Mon DD, YYYY  e.g. May 10, 2024
+    m = s.match(/^([A-Za-z]{3})\s+(\d{1,2}),?\s+(\d{4})$/)
+    if (m) {
+      const [, monStr, d, y] = m
+      const mo = MONTHS_SHORT[monStr.toLowerCase()]
+      if (!mo) return null
+      return `${y}-${mo}-${d.padStart(2,'0')}`
+    }
+    return null
+  }
+
+  /** Validate email — basic RFC check */
+  function isValidEmail(v: any): boolean {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v).trim())
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // STEP 1 — Drop fully blank rows
+  // ─────────────────────────────────────────────────────────────
+  let cleanedRows: any[][] = rows.filter((row: any[]) =>
+    row.some(v => v !== null && v !== undefined && String(v).trim() !== '')
+  )
+  const blankRowsRemoved = rows.length - cleanedRows.length
+
+  // ─────────────────────────────────────────────────────────────
+  // STEP 2 — Per-column type detection & normalisation pass
+  // ─────────────────────────────────────────────────────────────
+
+  /** Heuristic: is this column "date-like"? */
+  const isDateCol = (hdr: string) =>
+    /date|time|created|updated|purchased|order/i.test(hdr)
+
+  /** Heuristic: is this column "boolean-like"? */
+  const isBoolCol = (hdr: string, samples: any[]) => {
+    const uniq = [...new Set(samples.map(v => String(v).trim().toLowerCase()))]
+    const boolSet = new Set(['yes','no','true','false','1','0','y','n'])
+    return uniq.every(u => boolSet.has(u))
+  }
+
+  /** Heuristic: is this column "email-like"? */
+  const isEmailCol = (hdr: string) => /email|mail/i.test(hdr)
+
+  /** Heuristic: is this column "name/city/category/status-like" (categorical text)? */
+  const isTextCat = (hdr: string, colInfo: any) =>
+    colInfo.dataType === 'categorical' && !/id|code|uuid/i.test(hdr)
+
+  // Collect non-null samples per column for heuristics
+  const samples = headers.map((_: string, ci: number) =>
+    cleanedRows.map(r => r[ci]).filter(v => v !== null && v !== undefined && String(v).trim() !== '').slice(0, 50)
+  )
+
+  // Build per-column cleaning plan
+  const colPlan = headers.map((hdr: string, ci: number) => {
+    const colInfo = columnAnalysis[ci] || { dataType: 'categorical' }
+    const s = samples[ci]
+    return {
+      isDate:  isDateCol(hdr),
+      isBool:  isBoolCol(hdr, s),
+      isEmail: isEmailCol(hdr),
+      isText:  isTextCat(hdr, colInfo),
+      isNum:   colInfo.dataType === 'numerical',
     }
   })
-  
-  let cleanedRows = uniqueRowIndices.map(idx => [...rows[idx]])
-  const duplicatesRemoved = rows.length - cleanedRows.length
-  
-  // 2. Impute missing values & handle outliers
-  let missingValuesImputed = 0
-  let outliersCapped = 0
-  
-  // Determine imputation values
-  const columnImputeValues = headers.map((header: string, colIdx: number) => {
-    const colInfo = columnAnalysis[colIdx]
-    const values = cleanedRows.map(r => r[colIdx])
-    const nonNullValues = values.filter(v => v !== null && v !== undefined && v !== '' && String(v).trim().toLowerCase() !== 'null' && String(v).trim().toLowerCase() !== 'nan')
-    
-    if (colInfo.dataType === 'numerical') {
-      const numVals = nonNullValues.map(Number).filter(v => !isNaN(v))
-      if (numVals.length === 0) return 0
-      const sorted = [...numVals].sort((a, b) => a - b)
-      return sorted.length % 2 === 0 ? (sorted[sorted.length/2-1] + sorted[sorted.length/2]) / 2 : sorted[Math.floor(sorted.length/2)]
-    } else {
-      if (nonNullValues.length === 0) return 'Unknown'
-      const freq: Map<string, number> = new Map()
-      nonNullValues.forEach(v => {
-        const s = String(v).trim()
-        freq.set(s, (freq.get(s) || 0) + 1)
-      })
-      let mode = 'Unknown', maxFreq = 0
-      for (const [val, count] of freq) {
-        if (count > maxFreq) { mode = val; maxFreq = count }
+
+  let caseNormalized = 0
+  let dateNormalized = 0
+  let boolNormalized = 0
+  let emailsInvalidated = 0
+  let numericFormatFixed = 0
+
+  cleanedRows = cleanedRows.map((row: any[]) => {
+    return row.map((v: any, ci: number) => {
+      if (v === null || v === undefined || String(v).trim() === '') return v
+      const p = colPlan[ci]
+      let val = String(v).trim() // always trim whitespace
+
+      // Date normalisation
+      if (p.isDate) {
+        const d = parseDate(val)
+        if (d) { dateNormalized++; return d }
+        return null // unparseable date → null, will be imputed later
       }
-      return mode
-    }
+
+      // Boolean normalisation
+      if (p.isBool) {
+        const b = normaliseBool(val)
+        if (b !== null) { boolNormalized++; return b }
+        return null
+      }
+
+      // Email validation
+      if (p.isEmail) {
+        if (!isValidEmail(val)) { emailsInvalidated++; return null }
+        return val.toLowerCase()
+      }
+
+      // Numeric column — strip messy formatting, coerce
+      if (p.isNum) {
+        const n = parseNumber(val)
+        if (!isNaN(n)) {
+          if (String(val) !== String(n)) numericFormatFixed++
+          return n
+        }
+        return null // non-numeric in numeric col → null, imputed later
+      }
+
+      // Categorical text — title-case
+      if (p.isText && val.length < 80) {
+        const tc = toTitleCase(val)
+        if (tc !== val) caseNormalized++
+        return tc
+      }
+
+      return val
+    })
   })
-  
-  // Apply imputation and outlier capping
-  headers.forEach((header: string, colIdx: number) => {
-    const colInfo = columnAnalysis[colIdx]
-    const imputeVal = columnImputeValues[colIdx]
-    
-    // Impute
-    cleanedRows.forEach(row => {
-      const val = row[colIdx]
-      if (val === null || val === undefined || val === '' || String(val).trim().toLowerCase() === 'null' || String(val).trim().toLowerCase() === 'nan') {
-        row[colIdx] = imputeVal
+
+  // ─────────────────────────────────────────────────────────────
+  // STEP 3 — Remove fully blank rows again (after normalisation
+  //          some rows may have become all-null)
+  // ─────────────────────────────────────────────────────────────
+  cleanedRows = cleanedRows.filter((row: any[]) =>
+    row.some(v => v !== null && v !== undefined && v !== '')
+  )
+
+  // ─────────────────────────────────────────────────────────────
+  // STEP 4 — Per-column RANGE VALIDATION (clamp / null invalid)
+  // ─────────────────────────────────────────────────────────────
+  let rangeViolationsFixed = 0
+
+  const RANGE_RULES: Record<string, { min: number; max: number }> = {
+    age:       { min: 0,   max: 120 },
+    rating:    { min: 1,   max: 5   },
+    discount:  { min: 0,   max: 100 },
+    quantity:  { min: 1,   max: 999 },
+    price:     { min: 0,   max: Infinity },
+    salary:    { min: 0,   max: Infinity },
+    score:     { min: 0,   max: 100 },
+  }
+
+  headers.forEach((hdr: string, ci: number) => {
+    const key = Object.keys(RANGE_RULES).find(k => hdr.toLowerCase().includes(k))
+    if (!key) return
+    const { min, max } = RANGE_RULES[key]
+
+    cleanedRows.forEach((row: any[]) => {
+      const n = Number(row[ci])
+      if (!isNaN(n)) {
+        if (n < min || n > max) {
+          row[ci] = null // nullify; will be imputed below
+          rangeViolationsFixed++
+        }
+      }
+    })
+  })
+
+  // ─────────────────────────────────────────────────────────────
+  // STEP 5 — Compute imputation values (median for numeric,
+  //          mode for categorical) on already-normalised data
+  // ─────────────────────────────────────────────────────────────
+  const imputeVals = headers.map((_: string, ci: number) => {
+    const colInfo = columnAnalysis[ci] || { dataType: 'categorical' }
+    const vals = cleanedRows
+      .map((r: any[]) => r[ci])
+      .filter((v: any) => v !== null && v !== undefined && v !== '' &&
+        String(v).toLowerCase() !== 'null' && String(v).toLowerCase() !== 'nan')
+
+    if (colInfo.dataType === 'numerical') {
+      const nums = vals.map(Number).filter((n: number) => !isNaN(n))
+      if (nums.length === 0) return 0
+      const sorted = [...nums].sort((a: number, b: number) => a - b)
+      const mid = Math.floor(sorted.length / 2)
+      return sorted.length % 2 === 0
+        ? Math.round(((sorted[mid - 1] + sorted[mid]) / 2) * 100) / 100
+        : sorted[mid]
+    }
+    if (colPlan[ci].isBool) return 'No'
+    if (vals.length === 0) return 'Unknown'
+    const freq = new Map<string, number>()
+    vals.forEach((v: any) => {
+      const s = String(v).trim()
+      freq.set(s, (freq.get(s) || 0) + 1)
+    })
+    let mode = 'Unknown', maxF = 0
+    for (const [val, cnt] of freq) if (cnt > maxF) { mode = val; maxF = cnt }
+    return mode
+  })
+
+  // ─────────────────────────────────────────────────────────────
+  // STEP 6 — Apply imputation
+  // ─────────────────────────────────────────────────────────────
+  let missingValuesImputed = 0
+  cleanedRows.forEach((row: any[]) => {
+    row.forEach((v: any, ci: number) => {
+      if (v === null || v === undefined || v === '' ||
+          String(v).toLowerCase() === 'null' || String(v).toLowerCase() === 'nan') {
+        row[ci] = imputeVals[ci]
         missingValuesImputed++
       }
     })
-    
-    // Outlier Capping
-    if (colInfo.dataType === 'numerical') {
-      const numVals = cleanedRows.map(r => Number(r[colIdx])).filter(v => !isNaN(v))
-      if (numVals.length >= 4) {
-        const sorted = [...numVals].sort((a, b) => a - b)
-        const n = sorted.length
-        const q1 = sorted[Math.floor(n * 0.25)]
-        const q3 = sorted[Math.floor(n * 0.75)]
-        const iqr = q3 - q1
-        const lowerBound = q1 - 1.5 * iqr
-        const upperBound = q3 + 1.5 * iqr
-        
-        cleanedRows.forEach(row => {
-          const val = Number(row[colIdx])
-          if (!isNaN(val)) {
-            if (val < lowerBound) {
-              row[colIdx] = Math.round(lowerBound * 100) / 100
-              outliersCapped++
-            } else if (val > upperBound) {
-              row[colIdx] = Math.round(upperBound * 100) / 100
-              outliersCapped++
-            }
-          }
-        })
-      }
-    }
   })
-  
-  // 3. Recalculate Column Analysis & Stats
+
+  // ─────────────────────────────────────────────────────────────
+  // STEP 7 — IQR Outlier Capping (numeric columns only,
+  //          AFTER imputation so column is fully numeric)
+  // ─────────────────────────────────────────────────────────────
+  let outliersCapped = 0
+
+  // Skip columns with known hard range rules (already enforced above)
+  const hardRangeKeys = new Set(Object.keys(RANGE_RULES))
+
+  headers.forEach((hdr: string, ci: number) => {
+    const colInfo = columnAnalysis[ci] || { dataType: 'categorical' }
+    if (colInfo.dataType !== 'numerical') return
+    if ([...hardRangeKeys].some(k => hdr.toLowerCase().includes(k))) return
+
+    const numVals = cleanedRows.map((r: any[]) => Number(r[ci])).filter((n: number) => !isNaN(n))
+    if (numVals.length < 4) return
+
+    const sorted = [...numVals].sort((a: number, b: number) => a - b)
+    const n = sorted.length
+    const q1 = sorted[Math.floor(n * 0.25)]
+    const q3 = sorted[Math.floor(n * 0.75)]
+    const iqr = q3 - q1
+    const lower = q1 - 1.5 * iqr
+    const upper = q3 + 1.5 * iqr
+
+    cleanedRows.forEach((row: any[]) => {
+      const val = Number(row[ci])
+      if (!isNaN(val)) {
+        if (val < lower) { row[ci] = Math.round(lower * 100) / 100; outliersCapped++ }
+        else if (val > upper) { row[ci] = Math.round(upper * 100) / 100; outliersCapped++ }
+      }
+    })
+  })
+
+  // ─────────────────────────────────────────────────────────────
+  // STEP 8 — Deduplicate (exact + case-insensitive near-dups)
+  // ─────────────────────────────────────────────────────────────
+  const seenRows = new Set<string>()
+  const deduped: any[][] = []
+  cleanedRows.forEach((row: any[]) => {
+    const key = row.map(v => String(v ?? '').toLowerCase().trim()).join('|')
+    if (!seenRows.has(key)) { seenRows.add(key); deduped.push(row) }
+  })
+  const duplicatesRemoved = (rows.length - blankRowsRemoved) - deduped.length
+  cleanedRows = deduped
+
+  // ─────────────────────────────────────────────────────────────
+  // STEP 9 — Recalculate column analysis & quality score
+  // ─────────────────────────────────────────────────────────────
   const updatedColumnAnalysis = headers.map((header: string, idx: number) => {
-    const values = cleanedRows.map(r => r[idx])
-    const nonNull = values.filter(v => v !== null && v !== undefined && v !== '')
+    const values = cleanedRows.map((r: any[]) => r[idx])
+    const nonNull = values.filter((v: any) => v !== null && v !== undefined && v !== '')
     const uniqueValues = new Set(nonNull.map(String)).size
     const nullCount = values.length - nonNull.length
-    
     return {
       name: header,
       index: idx,
@@ -1037,16 +1260,20 @@ app.post('/api/datasets/:id/clean', async (c) => {
       sampleValues: nonNull.slice(0, 5).map(String)
     }
   })
-  
+
   const updatedNumericalStats: any = {}
-  updatedColumnAnalysis.filter((c: any) => c.dataType === 'numerical').forEach((col: any) => {
-    const values = cleanedRows.map(r => Number(r[col.index])).filter(v => !isNaN(v))
-    updatedNumericalStats[col.name] = calculateStats(values)
-  })
-  
+  updatedColumnAnalysis
+    .filter((c: any) => c.dataType === 'numerical')
+    .forEach((col: any) => {
+      const values = cleanedRows.map((r: any[]) => Number(r[col.index])).filter((v: number) => !isNaN(v))
+      updatedNumericalStats[col.name] = calculateStats(values)
+    })
+
   const updatedQualityScore = getDataQualityScore(cleanedRows, headers)
-  
-  // 4. Update the stored dataset
+
+  // ─────────────────────────────────────────────────────────────
+  // STEP 10 — Persist updated dataset
+  // ─────────────────────────────────────────────────────────────
   const updatedDataset = {
     ...dataset,
     rows: cleanedRows,
@@ -1058,14 +1285,21 @@ app.post('/api/datasets/:id/clean', async (c) => {
     duplicatePercent: 0,
     isCleaned: true,
     cleaningSummary: {
-      duplicatesRemoved,
+      duplicatesRemoved: duplicatesRemoved < 0 ? 0 : duplicatesRemoved,
+      blankRowsRemoved,
       missingValuesImputed,
-      outliersCapped
+      outliersCapped,
+      rangeViolationsFixed,
+      caseNormalized,
+      dateNormalized,
+      boolNormalized,
+      numericFormatFixed,
+      emailsInvalidated,
     }
   }
-  
+
   datasets.set(id, updatedDataset)
-  
+
   return c.json({
     success: true,
     ...updatedDataset,
@@ -1528,7 +1762,7 @@ const App = {
       this.state.dataset = data
       this.state.loading = false
       this.render()
-      this.showToast('Dataset cleaned and 100% of issues resolved!', 'success')
+      this.showToast('Dataset fully cleaned! All detectable issues resolved.', 'success')
       
       // Auto-reload dependencies
       this.loadEDA()
@@ -2443,17 +2677,25 @@ const App = {
     const d = this.state.dataset
     if (!cl || !d) return '<div class="flex items-center justify-center h-64"><div class="loading-spinner"></div></div>'
     
-    const cleanedBanner = d.isCleaned ? 
-      '<div class="bg-green-500/10 border border-green-500/20 text-green-400 rounded-xl p-5 mb-6 flex items-start gap-3">' +
-        '<i class="fas fa-circle-check text-xl mt-0.5"></i>' +
-        '<div class="flex-1">' +
-          '<h4 class="font-bold text-sm text-white">Dataset Cleaned Successfully!</h4>' +
-          '<p class="text-xs text-green-400/80 mt-1">All issues resolved with 100% accuracy.</p>' +
-          '<div class="flex flex-wrap gap-4 mt-3 text-[11px] text-dark-300">' +
-            '<span><strong class="text-white">' + (d.cleaningSummary?.duplicatesRemoved || 0) + '</strong> Duplicates Removed</span>' +
-            '<span><strong class="text-white">' + (d.cleaningSummary?.missingValuesImputed || 0) + '</strong> Missing Values Imputed</span>' +
-            '<span><strong class="text-white">' + (d.cleaningSummary?.outliersCapped || 0) + '</strong> Outliers Capped</span>' +
+    const cs = d.cleaningSummary || {}
+    const cleanedBanner = d.isCleaned ?
+      '<div class="bg-green-500/10 border border-green-500/20 text-green-400 rounded-xl p-5 mb-6">' +
+        '<div class="flex items-start gap-3 mb-4">' +
+          '<i class="fas fa-circle-check text-xl mt-0.5"></i>' +
+          '<div>' +
+            '<h4 class="font-bold text-sm text-white">Dataset Fully Cleaned!</h4>' +
+            '<p class="text-xs text-green-400/80 mt-0.5">Production-grade pipeline applied — all detectable issues resolved.</p>' +
           '</div>' +
+        '</div>' +
+        '<div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px]">' +
+          '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.duplicatesRemoved || 0) + '</div><div class="text-dark-400">Duplicates Removed</div></div>' +
+          '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.blankRowsRemoved || 0) + '</div><div class="text-dark-400">Blank Rows Dropped</div></div>' +
+          '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.missingValuesImputed || 0) + '</div><div class="text-dark-400">Missing Imputed</div></div>' +
+          '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.rangeViolationsFixed || 0) + '</div><div class="text-dark-400">Range Violations Fixed</div></div>' +
+          '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.caseNormalized || 0) + '</div><div class="text-dark-400">Text Case Normalised</div></div>' +
+          '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.dateNormalized || 0) + '</div><div class="text-dark-400">Dates Standardised</div></div>' +
+          '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.boolNormalized || 0) + '</div><div class="text-dark-400">Booleans Normalised</div></div>' +
+          '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + ((cs.numericFormatFixed || 0) + (cs.outliersCapped || 0)) + '</div><div class="text-dark-400">Numeric Issues Fixed</div></div>' +
         '</div>' +
       '</div>'
      : ''
