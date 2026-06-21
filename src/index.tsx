@@ -173,14 +173,14 @@ function parseCSV(text: string): { headers: string[]; rows: any[][] } {
 }
 
 // ============ AI INTEGRATION ============
-async function callAI(prompt: string, systemPrompt: string, apiKey: string): Promise<string> {
+async function callAI(prompt: string, systemPrompt: string, apiKey: string, isChatMode = false): Promise<string> {
   try {
     const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${apiKey}`,
-        'HTTP-Referer': 'https://github.com/google/antigravity',
+        'HTTP-Referer': 'https://ai-data-scientist.pages.dev',
         'X-Title': 'AI Data Scientist'
       },
       body: JSON.stringify({
@@ -189,19 +189,22 @@ async function callAI(prompt: string, systemPrompt: string, apiKey: string): Pro
           { role: 'system', content: systemPrompt },
           { role: 'user', content: prompt }
         ],
-        max_tokens: 4000,
-        temperature: 0.3
+        max_tokens: 8000,
+        temperature: isChatMode ? 0.7 : 0.3
       })
     })
     
     if (!response.ok) {
-      // Fallback to a generated analysis
-      return generateFallbackAnalysis(prompt)
+      const errText = await response.text()
+      throw new Error(`API error ${response.status}: ${errText.slice(0, 200)}`)
     }
     
     const data = await response.json() as any
-    return data.choices?.[0]?.message?.content || generateFallbackAnalysis(prompt)
-  } catch (e) {
+    const content = data.choices?.[0]?.message?.content
+    if (!content) throw new Error('Empty response from AI')
+    return content
+  } catch (e: any) {
+    if (isChatMode) throw e  // let chat endpoint handle errors properly
     return generateFallbackAnalysis(prompt)
   }
 }
@@ -550,8 +553,9 @@ app.get('/api/datasets/:id/visualizations', async (c) => {
 app.post('/api/datasets/:id/insights', async (c) => {
   const id = c.req.param('id')
   const dataset = datasets.get(id)
-  const apiKey = c.env?.POOLSIDE_API_KEY
-  if (!apiKey) return c.json({ error: 'POOLSIDE_API_KEY is not configured on the server.' }, 500)
+  if (!dataset) return c.json({ error: 'Dataset not found' }, 404)
+  const apiKey = c.env?.POOLSIDE_API_KEY || (typeof process !== 'undefined' ? (process as any).env?.POOLSIDE_API_KEY : undefined)
+  if (!apiKey) return c.json({ error: 'POOLSIDE_API_KEY is not configured. Add it to .dev.vars for local dev.' }, 500)
   
   const context = `
 Dataset: ${dataset.fileName}
@@ -597,37 +601,43 @@ app.post('/api/datasets/:id/chat', async (c) => {
   const dataset = datasets.get(id)
   if (!dataset) return c.json({ error: 'Dataset not found' }, 404)
   
-  const { message } = await c.req.json()
-  const apiKey = c.env?.POOLSIDE_API_KEY
-  if (!apiKey) return c.json({ error: 'POOLSIDE_API_KEY is not configured on the server.' }, 500)
+  const body = await c.req.json()
+  const { message } = body
+  if (!message || !String(message).trim()) return c.json({ error: 'Message is required.' }, 400)
+  const apiKey = c.env?.POOLSIDE_API_KEY || (typeof process !== 'undefined' ? (process as any).env?.POOLSIDE_API_KEY : undefined)
+  if (!apiKey) return c.json({ error: 'POOLSIDE_API_KEY is not configured. Add it to .dev.vars for local dev.' }, 500)
   
   const history = chatHistories.get(id) || []
   
   const context = `
 Dataset: ${dataset.fileName} (${dataset.rowCount} rows, ${dataset.columnCount} columns)
-Columns: ${dataset.columnAnalysis.map((c: any) => `${c.name} (${c.dataType}, ${c.uniqueValues} unique)`).join(', ')}
-Statistics: ${JSON.stringify(dataset.numericalStats)}
-Quality: ${dataset.qualityScore}%
-Sample: ${JSON.stringify(dataset.rows.slice(0, 3))}
-Previous conversation: ${history.slice(-4).map((h: any) => `${h.role}: ${h.content}`).join('\n')}
+Columns: ${dataset.columnAnalysis.map((c: any) => `${c.name} (${c.dataType}, ${c.uniqueValues} unique values)`).join(', ')}
+Numerical Statistics: ${JSON.stringify(dataset.numericalStats)}
+Data Quality: ${dataset.qualityScore}%
+All Column Details: ${JSON.stringify(dataset.columnAnalysis.map((c: any) => ({ name: c.name, type: c.dataType, unique: c.uniqueValues, nullPercent: c.nullPercent, samples: c.sampleValues })))}
+Sample Rows (first 10): ${JSON.stringify(dataset.rows.slice(0, 10))}
+Previous conversation: ${history.slice(-6).map((h: any) => `${h.role}: ${h.content}`).join('\n')}
 `
   
-  const systemPrompt = `You are an AI Data Scientist assistant. You have access to the user's dataset. Answer questions about the data with specific numbers and insights. Be concise, data-driven, and actionable. Reference actual column names and values from the dataset. If asked about predictions or forecasts, provide reasonable estimates based on the data patterns.
+  const systemPrompt = `You are an expert AI Data Scientist assistant with full access to the user's dataset metadata and samples. Answer every question thoroughly and completely. If the user asks for a full list, provide the ENTIRE list without truncation. If asked about all columns, list ALL of them. Be specific — use actual column names, real numbers, and real values from the dataset.
 
-IMPORTANT FORMATTING RULES:
-- Never use markdown syntax. No asterisks, no **bold**, no *italic*, no # headings.
-- Never use bullet points with - or * symbols. Use numbered lists (1. 2. 3.) or plain paragraphs instead.
-- Write in clear, natural sentences and short paragraphs.
-- Separate sections with a blank line, not with markdown headers.
-- Keep responses focused, structured, and easy to read as plain text.`
+FORMATTING RULES:
+- Never use markdown syntax. No **, no *, no #, no backticks.
+- Use numbered lists (1. 2. 3.) for ordered items.
+- Use plain dashes followed by a space (- item) only for unordered lists.
+- Use plain paragraphs separated by blank lines for explanation.
+- Never truncate a list. Always complete your answer fully.
+- Be as detailed and data-driven as the user requests.`
   
-  const result = await callAI(`Context about the dataset:\n${context}\n\nUser question: ${message}`, systemPrompt, apiKey)
-  
-  history.push({ role: 'user', content: message })
-  history.push({ role: 'assistant', content: result })
-  chatHistories.set(id, history.slice(-20))
-  
-  return c.json({ response: result })
+  try {
+    const result = await callAI(`Context about the dataset:\n${context}\n\nUser question: ${message}`, systemPrompt, apiKey, true)
+    history.push({ role: 'user', content: message })
+    history.push({ role: 'assistant', content: result })
+    chatHistories.set(id, history.slice(-20))
+    return c.json({ response: result })
+  } catch (e: any) {
+    return c.json({ error: e?.message || 'AI request failed. Please try again.' }, 500)
+  }
 })
 
 // ML Analysis
@@ -1329,12 +1339,16 @@ const App = {
       })
       const data = await res.json()
       this.state.chatLoading = false
-      this.state.chatMessages.push({ role: 'assistant', content: data.response || 'No response received.' })
+      if (!res.ok || data.error) {
+        this.state.chatMessages.push({ role: 'assistant', content: 'Error: ' + (data.error || 'Server error. Please try again.') })
+      } else {
+        this.state.chatMessages.push({ role: 'assistant', content: data.response || 'The AI returned an empty response. Please try again.' })
+      }
       this.render()
       setTimeout(() => { const c = document.getElementById('chat-messages'); if (c) c.scrollTop = c.scrollHeight }, 100)
     } catch (e) {
       this.state.chatLoading = false
-      this.state.chatMessages.push({ role: 'assistant', content: 'Sorry, I encountered an error. Please try again.' })
+      this.state.chatMessages.push({ role: 'assistant', content: 'Network error. Please check your connection and try again.' })
       this.render()
     }
   },
