@@ -1,20 +1,26 @@
 {
-  "name": "webapp",
+  "name": "ai-data-scientist",
+  "version": "1.0.0",
+  "description": "AI-powered data science platform that automates complete data analysis workflows",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "wrangler pages dev",
-    "deploy": "npm run build && wrangler pages deploy",
-    "cf-typegen": "wrangler types --env-interface CloudflareBindings"
+    "preview": "wrangler pages dev dist --ip 0.0.0.0 --port 3000",
+    "deploy": "npm run build && wrangler pages deploy dist",
+    "dev:sandbox": "wrangler pages dev dist --ip 0.0.0.0 --port 3000"
   },
   "dependencies": {
-    "hono": "^4.12.23"
+    "hono": "^4.7.0",
+    "papaparse": "^5.4.1",
+    "xlsx": "^0.18.5",
+    "simple-statistics": "^7.8.5"
   },
   "devDependencies": {
-    "@hono/vite-build": "^1.2.0",
-    "@hono/vite-dev-server": "^0.25.2",
-    "vite": "^6.3.5",
-    "wrangler": "^4.4.0"
+    "@cloudflare/workers-types": "^4.20250705.0",
+    "@hono/vite-cloudflare-pages": "^0.4.2",
+    "vite": "^5.4.0",
+    "wrangler": "^3.78.0",
+    "typescript": "^5.6.0"
   }
 }
