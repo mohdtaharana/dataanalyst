@@ -3026,7 +3026,7 @@ const App = {
     if (!tableData || !tableData.headers || !tableData.rows) return ''
     
     this.state.tableStates = this.state.tableStates || {}
-    const defaultPageSize = tableData.rows.length <= 50 ? tableData.rows.length : 10
+    const defaultPageSize = tableData.rows.length <= 100 ? tableData.rows.length : 10
     const tState = this.state.tableStates[tableId] || { page: 1, search: '', pageSize: defaultPageSize }
     this.state.tableStates[tableId] = tState
     
