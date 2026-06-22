@@ -1,6 +1,8 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 
+declare const __POOLSIDE_API_KEY__: string | undefined
+
 type Bindings = {
   POOLSIDE_API_KEY: string
 }
@@ -21,19 +23,20 @@ const chatHistories: Map<string, any[]> = new Map()
 function getApiKey(env: Bindings | undefined): string | undefined {
   if (env?.POOLSIDE_API_KEY) return env.POOLSIDE_API_KEY
   
-  // Try reading the local API key injected by Vite
+  // Vite replaces __POOLSIDE_API_KEY__ with the actual key from .dev.vars
   try {
-    const local = (typeof (globalThis as any).process !== 'undefined') ? (globalThis as any).process?.env?.LOCAL_POOLSIDE_API_KEY : undefined
-    if (local) return local
+    if (typeof __POOLSIDE_API_KEY__ !== 'undefined' && __POOLSIDE_API_KEY__) {
+      return __POOLSIDE_API_KEY__
+    }
   } catch {}
 
-  // Fallback to process.env.POOLSIDE_API_KEY
+  // Fallback to process.env.POOLSIDE_API_KEY (Node.js/PM2)
   try {
-    const p = (typeof (globalThis as any).process !== 'undefined') ? (globalThis as any).process?.env?.POOLSIDE_API_KEY : undefined
+    const p = (globalThis as any).process?.env?.POOLSIDE_API_KEY
     if (p) return p
   } catch {}
   
-  // Fallback to direct fs read (only if running in pure Node.js)
+  // Fallback to direct fs read (Node.js only)
   try {
     const fs = (globalThis as any).require?.('fs') || (globalThis as any).require('fs')
     const raw = fs.readFileSync('.dev.vars', 'utf8')
@@ -99,10 +102,14 @@ function calculateStats(values: number[]): any {
   const q3 = sorted[Math.floor(n * 0.75)]
   const iqr = q3 - q1
   
-  // Outliers
-  const lowerBound = q1 - 1.5 * iqr
-  const upperBound = q3 + 1.5 * iqr
-  const outliers = clean.filter(v => v < lowerBound || v > upperBound)
+  // Outliers — only meaningful when IQR > 0 (otherwise every
+  // value ≠ the spike value gets flagged as an outlier)
+  let outliers: number[] = []
+  if (iqr > 0) {
+    const lowerBound = q1 - 1.5 * iqr
+    const upperBound = q3 + 1.5 * iqr
+    outliers = clean.filter(v => v < lowerBound || v > upperBound)
+  }
   
   return {
     count: n,
@@ -888,8 +895,13 @@ app.get('/api/datasets/:id/cleaning', async (c) => {
     })
   }
   
-  // Outliers
+  // Outliers — skip for bounded/discrete columns (same logic as
+  // the cleaning pipeline's BOUNDED_COLUMNS set)
+  const isBoundedCol = (name: string) =>
+    ['quantity', 'rating', 'discount', 'score'].some(k => name.toLowerCase().includes(k))
+
   for (const col of columnAnalysis.filter((c: any) => c.dataType === 'numerical')) {
+    if (isBoundedCol(col.name)) continue
     const stats = dataset.numericalStats[col.name]
     if (stats && stats.outlierPercent > 2) {
       suggestions.push({
@@ -902,9 +914,12 @@ app.get('/api/datasets/:id/cleaning', async (c) => {
     }
   }
   
-  // High cardinality
+  // High cardinality — skip columns that look like IDs
+  const isIdLike = (name: string) => /(?:id|uuid|guid|code|key)/i.test(name)
+
   for (const col of columnAnalysis) {
-    if (col.dataType === 'text' && col.uniqueValues > rows.length * 0.9) {
+    if (col.dataType === 'text' && col.uniqueValues > rows.length * 0.9 &&
+        !isIdLike(col.name)) {
       suggestions.push({
         type: 'high_cardinality',
         column: col.name,
@@ -1040,6 +1055,27 @@ app.post('/api/datasets/:id/clean', async (c) => {
     return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v).trim())
   }
 
+  /** Convert English number words → number ("twenty five" → 25) */
+  function parseWordNumber(s: string): number | null {
+    const WORDS: Record<string, number> = {
+      'zero':0,'one':1,'two':2,'three':3,'four':4,'five':5,'six':6,'seven':7,'eight':8,'nine':9,'ten':10,
+      'eleven':11,'twelve':12,'thirteen':13,'fourteen':14,'fifteen':15,'sixteen':16,'seventeen':17,'eighteen':18,'nineteen':19,
+      'twenty':20,'thirty':30,'forty':40,'fifty':50,'sixty':60,'seventy':70,'eighty':80,'ninety':90,
+    }
+    const parts = s.trim().toLowerCase().split(/[\s-]+/)
+    if (parts.length === 0) return null
+    // Single word: "five"
+    if (parts.length === 1) return WORDS[parts[0]] ?? null
+    // Two words: "twenty five"
+    if (parts.length === 2) {
+      const tens = WORDS[parts[0]]
+      const units = WORDS[parts[1]]
+      if (tens !== undefined && tens >= 20 && tens <= 90 && tens % 10 === 0 && units !== undefined && units < 10)
+        return tens + units
+    }
+    return null
+  }
+
   // ─────────────────────────────────────────────────────────────
   // STEP 1 — Drop fully blank rows
   // ─────────────────────────────────────────────────────────────
@@ -1060,9 +1096,8 @@ app.post('/api/datasets/:id/clean', async (c) => {
   const isBoolCol = (_hdr: string, samp: any[]) => {
     if (samp.length === 0) return false
     const uniq = [...new Set(samp.map(v => String(v).trim().toLowerCase()))]
-    const boolSet = new Set(['yes','no','true','false','1','0','y','n'])
-    // All unique values must be boolean-like AND column must have ≤4 distinct values
-    return uniq.length <= 4 && uniq.every(u => boolSet.has(u))
+    const boolSet = new Set(['yes','no','true','false','1','0','y','n','t','f','on','off'])
+    return uniq.every(u => boolSet.has(u))
   }
 
   const isEmailCol = (hdr: string) => /\bemail\b|\bmail\b/i.test(hdr)
@@ -1143,6 +1178,16 @@ app.post('/api/datasets/:id/clean', async (c) => {
   let numericFormatFixed = 0
   let semanticMapped = 0
 
+  // Per-column parsing/validation/imputation stats (for debugging)
+  const colStats: { parsedOk: number; parseFailed: number; outOfRange: number; imputed: number }[] =
+    headers.map(() => ({ parsedOk: 0, parseFailed: 0, outOfRange: 0, imputed: 0 }))
+
+  // Track only genuinely-numeric (parseNumber success, NOT parseWordNumber) values
+  // for computing the imputation median — word-converted values like "twenty five"
+  // would pull the median toward the converted value and corrupt imputation of
+  // range-violations (-5, 150) and missing values.
+  const numericPools: number[][] = headers.map(() => [])
+
   cleanedRows = cleanedRows.map((row: any[]) => {
     return row.map((v: any, ci: number) => {
       // Always skip null/empty — they are handled in imputation
@@ -1182,9 +1227,17 @@ app.post('/api/datasets/:id/clean', async (c) => {
         const n = parseNumber(val)
         if (!isNaN(n)) {
           if (String(val) !== String(n)) numericFormatFixed++
+          colStats[ci].parsedOk++
+          numericPools[ci].push(n)
           return n
         }
-        // BUG FIX: non-parseable in numeric col → null (imputed later), not kept as string
+        // Try word-to-number ("twenty five" → 25, "five" → 5)
+        // NOTE: NOT added to numericPools — word-converted values would skew
+        // the imputation median because they cluster at the converted value.
+        const word = parseWordNumber(String(val))
+        if (word !== null) { numericFormatFixed++; colStats[ci].parsedOk++; return word }
+        colStats[ci].parseFailed++
+        // Genuinely unparseable → null (imputed later with median/mode)
         return null
       }
 
@@ -1240,6 +1293,7 @@ app.post('/api/datasets/:id/clean', async (c) => {
         if (n < min || n > max) {
           row[ci] = null // nullify; will be imputed below
           rangeViolationsFixed++
+          colStats[ci].outOfRange++
         }
       }
     })
@@ -1257,7 +1311,7 @@ app.post('/api/datasets/:id/clean', async (c) => {
         String(v).toLowerCase() !== 'null' && String(v).toLowerCase() !== 'nan')
 
     if (colInfo.dataType === 'numerical') {
-      const nums = vals.map(Number).filter((n: number) => !isNaN(n))
+      const nums = numericPools[ci]
       if (nums.length === 0) return 0
       const sorted = [...nums].sort((a: number, b: number) => a - b)
       const mid = Math.floor(sorted.length / 2)
@@ -1278,15 +1332,17 @@ app.post('/api/datasets/:id/clean', async (c) => {
   })
 
   // ─────────────────────────────────────────────────────────────
-  // STEP 6 — Apply imputation
+  // STEP 6 — Apply imputation (only touch null values)
   // ─────────────────────────────────────────────────────────────
   let missingValuesImputed = 0
+
   cleanedRows.forEach((row: any[]) => {
     row.forEach((v: any, ci: number) => {
       if (v === null || v === undefined || v === '' ||
           String(v).toLowerCase() === 'null' || String(v).toLowerCase() === 'nan') {
         row[ci] = imputeVals[ci]
         missingValuesImputed++
+        colStats[ci].imputed++
       }
     })
   })
@@ -1297,13 +1353,19 @@ app.post('/api/datasets/:id/clean', async (c) => {
   // ─────────────────────────────────────────────────────────────
   let outliersCapped = 0
 
-  // Skip columns with known hard range rules (already enforced above)
-  const hardRangeKeys = new Set(Object.keys(RANGE_RULES))
+  // Columns where IQR outlier capping is meaningless because the
+  // column is discrete/bounded (e.g. small-integer ratings, quantities)
+  const BOUNDED_COLUMNS = new Set(['quantity', 'rating', 'discount', 'score'])
 
   headers.forEach((hdr: string, ci: number) => {
-    const colInfo = columnAnalysis[ci] || { dataType: 'categorical' }
-    if (colInfo.dataType !== 'numerical') return
-    if ([...hardRangeKeys].some(k => hdr.toLowerCase().includes(k))) return
+    // Use colPlan (which merges upload-detected type + name-based heuristics)
+    // rather than raw columnAnalysis.dataType — otherwise columns like
+    // "Price" that looked like text ($1,492.50) would skip IQR entirely.
+    if (!colPlan[ci].isNum) return
+
+    // Skip discrete/bounded columns — IQR capping is only meaningful
+    // for continuous unbounded columns like Price, Age, Salary
+    if (BOUNDED_COLUMNS.has(hdr.toLowerCase())) return
 
     const numVals = cleanedRows.map((r: any[]) => Number(r[ci])).filter((n: number) => !isNaN(n))
     if (numVals.length < 4) return
@@ -1313,16 +1375,53 @@ app.post('/api/datasets/:id/clean', async (c) => {
     const q1 = sorted[Math.floor(n * 0.25)]
     const q3 = sorted[Math.floor(n * 0.75)]
     const iqr = q3 - q1
+
+    // Skip if no spread — capping would collapse the whole column to Q1
+    if (iqr === 0) return
+
     const lower = q1 - 1.5 * iqr
     const upper = q3 + 1.5 * iqr
+
+    // Detect whether column values are all integers so we round the
+    // capped value to an integer too (avoids 1.5 / 5.5 in quantity cols)
+    const isIntegerCol = numVals.every(v => Number.isInteger(v))
 
     cleanedRows.forEach((row: any[]) => {
       const val = Number(row[ci])
       if (!isNaN(val)) {
-        if (val < lower) { row[ci] = Math.round(lower * 100) / 100; outliersCapped++ }
-        else if (val > upper) { row[ci] = Math.round(upper * 100) / 100; outliersCapped++ }
+        if (val < lower) {
+          row[ci] = isIntegerCol ? Math.round(lower) : Math.round(lower * 100) / 100
+          outliersCapped++
+        } else if (val > upper) {
+          row[ci] = isIntegerCol ? Math.round(upper) : Math.round(upper * 100) / 100
+          outliersCapped++
+        }
       }
     })
+  })
+
+  // ─────────────────────────────────────────────────────────────
+  // SAFETY: detect any *numerical* column that collapsed to a
+  // single value (categorical columns can legitimately be uniform)
+  // ─────────────────────────────────────────────────────────────
+  for (let ci = 0; ci < headers.length; ci++) {
+    if (!colPlan[ci].isNum) continue
+    const uniq = new Set(cleanedRows.map(r => r[ci]).filter(v => v !== null && v !== undefined).map(String))
+    if (uniq.size === 1 && cleanedRows.length > 10) {
+      console.error(`BUG: Column "${headers[ci]}" collapsed to single value`)
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // STATS LOG (server-side debug) — helps detect imputation bugs
+  // ─────────────────────────────────────────────────────────────
+  headers.forEach((hdr: string, ci: number) => {
+    if (!colPlan[ci].isNum) return
+    const s = colStats[ci]
+    if (s.parsedOk || s.parseFailed || s.outOfRange || s.imputed) {
+      // eslint-disable-next-line no-console
+      console.log(`[${hdr}] parsed=${s.parsedOk} failed=${s.parseFailed} oor=${s.outOfRange} imputed=${s.imputed}`)
+    }
   })
 
   // ─────────────────────────────────────────────────────────────
@@ -1504,7 +1603,7 @@ function generateMainHTML(): string {
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.29/jspdf.plugin.autotable.min.js"></script>
     <link rel="stylesheet" href="/styles.css">
 </head>
-<body class="bg-dark-950 text-white font-['Inter'] antialiased">
+<body class="bg-dark-950 text-white font-['Inter'] antialiased overflow-x-hidden">
     <div id="app"></div>
     <script src="/app.js"></script>
 </body>
@@ -1555,6 +1654,11 @@ function getAppCSS(): string {
 
 .quality-bar { height: 8px; border-radius: 4px; background: rgba(30,41,59,0.8); overflow: hidden; }
 .quality-fill { height: 100%; border-radius: 4px; transition: width 1s ease; }
+
+.main-content { width: 100%; margin-left: 0; }
+@media (min-width: 768px) {
+  .main-content { width: calc(100vw - 256px); margin-left: 256px; }
+}
 
 .nav-item { transition: all 0.2s ease; }
 .nav-item:hover { background: rgba(59,130,246,0.1); }
@@ -1798,12 +1902,15 @@ const App = {
     }
   },
 
+  _searchTimers: {},
+
   searchTable(tableId, query) {
     this.state.tableStates = this.state.tableStates || {}
     this.state.tableStates[tableId] = this.state.tableStates[tableId] || { page: 1, search: '', pageSize: 5 }
     this.state.tableStates[tableId].search = query
     this.state.tableStates[tableId].page = 1
-    this.render()
+    if (this._searchTimers[tableId]) clearTimeout(this._searchTimers[tableId])
+    this._searchTimers[tableId] = setTimeout(() => this.render(), 250)
   },
   
   setTablePage(tableId, page) {
@@ -2106,19 +2213,19 @@ const App = {
       </div>
       
       <!-- Header -->
-      <header class="relative z-10 flex items-center justify-between px-8 py-5 glass border-b border-white/5">
-        <div class="flex items-center gap-3">
-          <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-primary-500 to-purple-600 flex items-center justify-center">
-            <i class="fas fa-brain text-white text-lg"></i>
+      <header class="relative z-10 flex items-center justify-between px-4 md:px-8 py-3 md:py-5 glass border-b border-white/5">
+        <div class="flex items-center gap-2 md:gap-3 min-w-0">
+          <div class="w-8 md:w-10 h-8 md:h-10 rounded-xl bg-gradient-to-br from-primary-500 to-purple-600 flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-brain text-white text-sm md:text-lg"></i>
           </div>
-          <div>
-            <h1 class="text-xl font-bold text-white">AI Data Scientist</h1>
-            <p class="text-xs text-dark-400">Intelligent Analysis Platform</p>
+          <div class="min-w-0">
+            <h1 class="text-sm md:text-xl font-bold text-white truncate">AI Data Scientist</h1>
+            <p class="text-[10px] md:text-xs text-dark-400 truncate">Intelligent Analysis Platform</p>
           </div>
         </div>
-        <div class="flex items-center gap-4">
-          <span class="px-3 py-1 rounded-full text-xs font-medium bg-green-500/10 text-green-400 border border-green-500/20">
-            <i class="fas fa-circle text-[6px] mr-1.5 animate-pulse"></i>Online
+        <div class="flex items-center gap-2 md:gap-4 flex-shrink-0">
+          <span class="px-2 md:px-3 py-0.5 md:py-1 rounded-full text-[10px] md:text-xs font-medium bg-green-500/10 text-green-400 border border-green-500/20 whitespace-nowrap">
+            <i class="fas fa-circle text-[4px] md:text-[6px] mr-1 md:mr-1.5 animate-pulse"></i>Online
           </span>
         </div>
       </header>
@@ -2127,7 +2234,7 @@ const App = {
       <main class="relative z-10 flex flex-col items-center justify-center py-8 md:py-12 px-4">
         <div class="text-center max-w-4xl mx-auto slide-up">
           <div class="inline-flex items-center gap-2 px-4 py-1.5 rounded-full glass-light text-sm text-dark-300 mb-4">
-            <i class="fas fa-sparkles text-primary-400"></i>
+            <i class="fas fa-bolt text-primary-400"></i>
             Powered by Advanced AI
           </div>
           
@@ -2214,12 +2321,12 @@ const App = {
     }
     
     return \`
-    <div class="min-h-screen flex flex-col md:flex-row">
+    <div class="min-h-screen">
       <!-- Sidebar Mobile Backdrop Overlay -->
       \${this.state.sidebarOpen ? \`<div onclick="App.toggleSidebar(event)" class="md:hidden fixed inset-0 bg-dark-950/60 backdrop-blur-sm z-30 transition-opacity"></div>\` : ''}
 
       <!-- Sidebar -->
-      <aside class="sidebar w-64 min-h-screen glass border-r border-white/5 flex-col fixed left-0 top-0 z-40 \${this.state.sidebarOpen ? 'flex' : 'hidden'} md:flex">
+      <aside class="sidebar w-64 h-screen glass border-r border-white/5 flex-col overflow-y-auto \${this.state.sidebarOpen ? 'fixed left-0 top-0 z-40 flex' : 'hidden'} md:fixed md:flex">
         <div class="p-5 border-b border-white/5 flex items-center justify-between">
           <div class="flex items-center gap-3">
             <div class="w-9 h-9 rounded-lg bg-gradient-to-br from-primary-500 to-purple-600 flex items-center justify-center">
@@ -2261,27 +2368,29 @@ const App = {
       </aside>
 
       <!-- Main Layout Wrapper -->
-      <div class="flex-1 flex flex-col min-h-screen ml-0 md:ml-64">
+      <div class="main-content flex flex-col min-h-screen overflow-y-auto">
         <!-- Mobile Top Bar -->
-        <header class="md:hidden flex items-center justify-between px-4 py-3 glass border-b border-white/5 sticky top-0 z-30">
-          <div class="flex items-center gap-3">
-            <button onclick="App.toggleSidebar(event)" class="w-9 h-9 rounded-lg glass-light flex items-center justify-center hover:bg-white/10 active:scale-95 transition-transform text-white">
+        <header class="md:hidden flex items-center justify-between px-4 py-3 glass border-b border-white/5 fixed top-0 left-0 right-0 z-50">
+          <div class="flex items-center gap-3 min-w-0 flex-shrink">
+            <button onclick="App.toggleSidebar(event)" class="w-9 h-9 rounded-lg glass-light flex items-center justify-center hover:bg-white/10 active:scale-95 transition-transform text-white flex-shrink-0">
               <i class="fas fa-bars"></i>
             </button>
-            <div class="flex items-center gap-2">
-              <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-primary-500 to-purple-600 flex items-center justify-center">
+            <div class="flex items-center gap-2 min-w-0">
+              <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-primary-500 to-purple-600 flex items-center justify-center flex-shrink-0">
                 <i class="fas fa-brain text-white text-[10px]"></i>
               </div>
-              <span class="text-sm font-bold text-white">AI Data Scientist</span>
+              <span class="text-sm font-bold text-white truncate">AI Data Scientist</span>
             </div>
           </div>
-          <div class="flex items-center gap-2">
+          <div class="flex items-center gap-2 flex-shrink-0">
             <span class="text-[10px] px-2.5 py-0.5 rounded-full bg-green-500/10 text-green-400 border border-green-500/20">Online</span>
           </div>
         </header>
+        <!-- Mobile header spacer -->
+        <div class="md:hidden h-[57px]"></div>
 
         <!-- Main Content -->
-        <main class="flex-1 p-4 md:p-6 overflow-y-auto">
+        <main class="flex-1 p-4 md:p-6">
           \${this.state.loading ? \`
             <div class="flex items-center justify-center h-64">
               <div class="text-center">
@@ -2331,12 +2440,12 @@ const App = {
     
     return \`
     <div class="fade-in">
-      <div class="flex items-center justify-between mb-6">
-        <div>
+      <div class="flex items-start justify-between gap-3 mb-6 flex-wrap">
+        <div class="min-w-0">
           <h2 class="text-2xl font-bold text-white">Interactive Data Explorer</h2>
           <p class="text-sm text-dark-400 mt-1">Filter and query your dataset to extract key insights</p>
         </div>
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-2 flex-shrink-0">
           <button onclick="App.downloadFilteredCSV()" class="btn-primary px-4 py-2 rounded-lg text-sm font-medium text-white flex items-center gap-2">
             <i class="fas fa-file-csv"></i> Export Filtered CSV
           </button>
@@ -2451,61 +2560,61 @@ const App = {
     
     return \`
     <div class="fade-in">
-      <div class="flex items-center justify-between mb-6">
-        <div>
+      <div class="flex items-start justify-between gap-3 mb-6 flex-wrap">
+        <div class="min-w-0">
           <h2 class="text-2xl font-bold text-white">Dataset Overview</h2>
-          <p class="text-sm text-dark-400 mt-1">\${d.fileName}</p>
+          <p class="text-sm text-dark-400 mt-1 truncate max-w-full">\${d.fileName}</p>
         </div>
-        <div class="flex items-center gap-2">
-          <span class="px-3 py-1.5 rounded-lg text-xs font-medium glass-light text-dark-300">
+        <div class="flex items-center gap-2 flex-shrink-0">
+          <span class="px-3 py-1.5 rounded-lg text-xs font-medium glass-light text-dark-300 whitespace-nowrap">
             <i class="fas fa-clock mr-1"></i>Just uploaded
           </span>
         </div>
       </div>
       
       <!-- KPI Cards -->
-      <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         <div class="glass-card rounded-xl p-4">
           <div class="flex items-center gap-3">
-            <div class="w-10 h-10 rounded-lg bg-primary-500/10 flex items-center justify-center">
+            <div class="w-10 h-10 rounded-lg bg-primary-500/10 flex items-center justify-center flex-shrink-0">
               <i class="fas fa-table-list text-primary-400"></i>
             </div>
-            <div>
-              <p class="text-2xl font-bold text-white">\${d.rowCount.toLocaleString()}</p>
-              <p class="text-xs text-dark-500">Total Rows</p>
+            <div class="min-w-0">
+              <p class="text-xl sm:text-2xl font-bold text-white truncate">\${d.rowCount.toLocaleString()}</p>
+              <p class="text-xs text-dark-500 truncate">Total Rows</p>
             </div>
           </div>
         </div>
         <div class="glass-card rounded-xl p-4">
           <div class="flex items-center gap-3">
-            <div class="w-10 h-10 rounded-lg bg-purple-500/10 flex items-center justify-center">
+            <div class="w-10 h-10 rounded-lg bg-purple-500/10 flex items-center justify-center flex-shrink-0">
               <i class="fas fa-table-columns text-purple-400"></i>
             </div>
-            <div>
-              <p class="text-2xl font-bold text-white">\${d.columnCount}</p>
-              <p class="text-xs text-dark-500">Columns</p>
+            <div class="min-w-0">
+              <p class="text-xl sm:text-2xl font-bold text-white truncate">\${d.columnCount}</p>
+              <p class="text-xs text-dark-500 truncate">Columns</p>
             </div>
           </div>
         </div>
         <div class="glass-card rounded-xl p-4">
           <div class="flex items-center gap-3">
-            <div class="w-10 h-10 rounded-lg bg-green-500/10 flex items-center justify-center">
-              <i class="fas fa-shield-check text-green-400"></i>
+            <div class="w-10 h-10 rounded-lg bg-green-500/10 flex items-center justify-center flex-shrink-0">
+              <i class="fas fa-circle-check text-green-400"></i>
             </div>
-            <div>
-              <p class="text-2xl font-bold text-white">\${d.qualityScore}%</p>
-              <p class="text-xs text-dark-500">Data Quality</p>
+            <div class="min-w-0">
+              <p class="text-xl sm:text-2xl font-bold text-white truncate">\${d.qualityScore}%</p>
+              <p class="text-xs text-dark-500 truncate">Data Quality</p>
             </div>
           </div>
         </div>
         <div class="glass-card rounded-xl p-4">
           <div class="flex items-center gap-3">
-            <div class="w-10 h-10 rounded-lg bg-amber-500/10 flex items-center justify-center">
+            <div class="w-10 h-10 rounded-lg bg-amber-500/10 flex items-center justify-center flex-shrink-0">
               <i class="fas fa-copy text-amber-400"></i>
             </div>
-            <div>
-              <p class="text-2xl font-bold text-white">\${d.duplicateCount}</p>
-              <p class="text-xs text-dark-500">Duplicates</p>
+            <div class="min-w-0">
+              <p class="text-xl sm:text-2xl font-bold text-white truncate">\${d.duplicateCount}</p>
+              <p class="text-xs text-dark-500 truncate">Duplicates</p>
             </div>
           </div>
         </div>
@@ -2831,9 +2940,9 @@ const App = {
       
       <!-- Quality Score -->
       <div class="glass-card rounded-xl p-5 mb-6">
-        <div class="flex items-center justify-between mb-3">
-          <h3 class="text-lg font-semibold text-white">Data Quality Score</h3>
-          <span class="text-3xl font-bold \${cl.qualityScore >= 80 ? 'text-green-400' : cl.qualityScore >= 60 ? 'text-amber-400' : 'text-red-400'}">\${cl.qualityScore}%</span>
+        <div class="flex items-center justify-between gap-3 mb-3">
+          <h3 class="text-base sm:text-lg font-semibold text-white">Data Quality Score</h3>
+          <span class="text-2xl sm:text-3xl font-bold flex-shrink-0 \${cl.qualityScore >= 80 ? 'text-green-400' : cl.qualityScore >= 60 ? 'text-amber-400' : 'text-red-400'}">\${cl.qualityScore}%</span>
         </div>
         <div class="quality-bar">
           <div class="quality-fill \${cl.qualityScore >= 80 ? 'bg-green-500' : cl.qualityScore >= 60 ? 'bg-amber-500' : 'bg-red-500'}" style="width:\${cl.qualityScore}%"></div>
@@ -2852,9 +2961,9 @@ const App = {
                 (s.severity === 'high' ? 'bg-red-500/10' : s.severity === 'medium' ? 'bg-amber-500/10' : 'bg-blue-500/10') +
               '">' +
                 '<i class="fas ' +
-                  (s.type === 'missing_values' ? 'fa-question-circle' :
+                  (s.type === 'missing_values' ? 'fa-circle-question' :
                    s.type === 'duplicates' ? 'fa-copy' :
-                   s.type === 'outliers' ? 'fa-chart-scatter' : 'fa-exclamation-triangle') +
+                   s.type === 'outliers' ? 'fa-chart-line' : 'fa-triangle-exclamation') +
                   ' text-sm ' +
                   (s.severity === 'high' ? 'text-red-400' : s.severity === 'medium' ? 'text-amber-400' : 'text-blue-400') +
                 '"></i>' +
@@ -2953,21 +3062,21 @@ const App = {
     <div class="fade-in flex flex-col h-[calc(100vh-56px)]">
 
       <!-- Chat Header -->
-      <div class="glass-card rounded-2xl px-6 py-4 mb-4 flex items-center justify-between flex-shrink-0 border border-primary-500/10">
-        <div class="flex items-center gap-3">
-          <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-primary-500 to-purple-600 flex items-center justify-center shadow-lg shadow-primary-500/20">
-            <i class="fas fa-robot text-white text-sm"></i>
+      <div class="glass-card rounded-2xl px-4 md:px-6 py-3 md:py-4 mb-4 flex items-center justify-between flex-shrink-0 gap-2 border border-primary-500/10">
+        <div class="flex items-center gap-2 md:gap-3 min-w-0">
+          <div class="w-8 md:w-10 h-8 md:h-10 rounded-xl bg-gradient-to-br from-primary-500 to-purple-600 flex items-center justify-center shadow-lg shadow-primary-500/20 flex-shrink-0">
+            <i class="fas fa-robot text-white text-xs md:text-sm"></i>
           </div>
-          <div>
-            <h2 class="text-base font-bold text-white">AI Data Scientist</h2>
+          <div class="min-w-0">
+            <h2 class="text-sm md:text-base font-bold text-white truncate">AI Data Scientist</h2>
             <div class="flex items-center gap-1.5">
-              <span class="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse"></span>
-              <span class="text-[11px] text-green-400 font-medium">Online &bull; Ready to analyze</span>
+              <span class="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse flex-shrink-0"></span>
+              <span class="text-[10px] md:text-[11px] text-green-400 font-medium truncate">Online &bull; Ready to analyze</span>
             </div>
           </div>
         </div>
-        <button onclick="App.state.chatMessages=[];App.render()" class="px-3 py-1.5 rounded-lg text-xs text-dark-400 hover:text-white glass-light transition-all">
-          <i class="fas fa-trash-can mr-1.5"></i>Clear
+        <button onclick="App.state.chatMessages=[];App.render()" class="px-2.5 md:px-3 py-1 md:py-1.5 rounded-lg text-[10px] md:text-xs text-dark-400 hover:text-white glass-light transition-all flex-shrink-0 whitespace-nowrap">
+          <i class="fas fa-trash-can mr-1 md:mr-1.5"></i>Clear
         </button>
       </div>
 
@@ -3286,7 +3395,7 @@ const App = {
       <!-- Quality Gauge -->
       <div class="glass-card rounded-xl p-5">
         <h3 class="text-sm font-semibold text-white mb-4">Overall Data Quality</h3>
-        <div class="flex items-center gap-6">
+        <div class="flex flex-col sm:flex-row items-center gap-4 sm:gap-6">
           <div class="relative w-32 h-32">
             <svg class="w-full h-full" viewBox="0 0 36 36">
               <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="rgba(148,163,184,0.1)" stroke-width="3"/>

@@ -14,7 +14,7 @@ try {
 export default defineConfig({
   plugins: [pages()],
   define: {
-    'process.env.LOCAL_POOLSIDE_API_KEY': JSON.stringify(localKey)
+    __POOLSIDE_API_KEY__: JSON.stringify(localKey)
   },
   build: {
     outDir: 'dist',
