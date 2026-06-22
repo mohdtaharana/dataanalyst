@@ -1022,39 +1022,86 @@ app.post('/api/datasets/:id/clean', async (c) => {
   // STEP 2 — Per-column type detection & normalisation pass
   // ─────────────────────────────────────────────────────────────
 
-  /** Heuristic: is this column "date-like"? */
+  // BUG FIX: was matching "order" → clobbered OrderID, OrderStatus
   const isDateCol = (hdr: string) =>
-    /date|time|created|updated|purchased|order/i.test(hdr)
+    /\bdate\b|\btime\b|created_at|updated_at|purchased_at/i.test(hdr)
 
-  /** Heuristic: is this column "boolean-like"? */
-  const isBoolCol = (hdr: string, samples: any[]) => {
-    const uniq = [...new Set(samples.map(v => String(v).trim().toLowerCase()))]
+  // BUG FIX: return false if samples empty (avoids vacuous truth in [].every())
+  const isBoolCol = (_hdr: string, samp: any[]) => {
+    if (samp.length === 0) return false
+    const uniq = [...new Set(samp.map(v => String(v).trim().toLowerCase()))]
     const boolSet = new Set(['yes','no','true','false','1','0','y','n'])
-    return uniq.every(u => boolSet.has(u))
+    // All unique values must be boolean-like AND column must have ≤4 distinct values
+    return uniq.length <= 4 && uniq.every(u => boolSet.has(u))
   }
 
-  /** Heuristic: is this column "email-like"? */
-  const isEmailCol = (hdr: string) => /email|mail/i.test(hdr)
+  const isEmailCol = (hdr: string) => /\bemail\b|\bmail\b/i.test(hdr)
 
-  /** Heuristic: is this column "name/city/category/status-like" (categorical text)? */
+  // BUG FIX: columns whose name contains id/code/uuid are identifiers — skip ALL transforms
+  const isIdCol = (hdr: string) => /\bid\b|_id$|^id_/i.test(hdr)
+
+  // BUG FIX: detect price/amount/cost/salary columns by NAME regardless of upload-detected type
+  const isNumericByName = (hdr: string) =>
+    /\bprice\b|\bamount\b|\bcost\b|\brevenue\b|\bfee\b|\bsalary\b|\btax\b|\btotal\b|\bsubtotal\b|\bincome\b/i.test(hdr)
+
   const isTextCat = (hdr: string, colInfo: any) =>
-    colInfo.dataType === 'categorical' && !/id|code|uuid/i.test(hdr)
+    colInfo.dataType === 'categorical' && !isIdCol(hdr) && !isDateCol(hdr)
 
-  // Collect non-null samples per column for heuristics
+  // Semantic synonym maps — normalise equivalent labels to one canonical value
+  const SEMANTIC_MAPS: Record<string, Record<string, string>> = {
+    paymentmethod: {
+      'cod': 'Cash On Delivery', 'c.o.d': 'Cash On Delivery', 'cash on delivery': 'Cash On Delivery', 'cash': 'Cash On Delivery',
+      'card': 'Credit Card', 'credit': 'Credit Card', 'credit card': 'Credit Card',
+      'debit': 'Debit Card', 'debit card': 'Debit Card',
+      'online': 'Online Transfer', 'bank transfer': 'Bank Transfer', 'transfer': 'Bank Transfer',
+      'jazzcash': 'JazzCash', 'jazz cash': 'JazzCash',
+      'easypaisa': 'EasyPaisa', 'easy paisa': 'EasyPaisa',
+      'paypal': 'PayPal',
+    },
+    country: {
+      'pk': 'Pakistan', 'pakistan': 'Pakistan',
+      'us': 'United States', 'usa': 'United States', 'united states': 'United States', 'united states of america': 'United States',
+      'uk': 'United Kingdom', 'gb': 'United Kingdom', 'great britain': 'United Kingdom', 'united kingdom': 'United Kingdom',
+      'uae': 'UAE', 'united arab emirates': 'UAE',
+      'in': 'India', 'india': 'India',
+      'bd': 'Bangladesh', 'bangladesh': 'Bangladesh',
+    },
+    gender: {
+      'm': 'Male', 'male': 'Male',
+      'f': 'Female', 'female': 'Female',
+      'other': 'Other', 'non-binary': 'Other',
+    },
+  }
+
+  // Find the semantic map key for a column header (if any)
+  const getSemanticMapKey = (hdr: string): string | null => {
+    const h = hdr.toLowerCase().replace(/[^a-z]/g, '')
+    return Object.keys(SEMANTIC_MAPS).find(k => h.includes(k)) || null
+  }
+
+  // Collect non-null samples per column for heuristics (100 samples for accuracy)
   const samples = headers.map((_: string, ci: number) =>
-    cleanedRows.map(r => r[ci]).filter(v => v !== null && v !== undefined && String(v).trim() !== '').slice(0, 50)
+    cleanedRows.map(r => r[ci])
+      .filter(v => v !== null && v !== undefined && String(v).trim() !== '')
+      .slice(0, 100)
   )
+
+  // Snapshot original samples for safe imputation fallback
+  const originalSamples = samples
 
   // Build per-column cleaning plan
   const colPlan = headers.map((hdr: string, ci: number) => {
     const colInfo = columnAnalysis[ci] || { dataType: 'categorical' }
-    const s = samples[ci]
+    const samp = samples[ci]
+    const isId = isIdCol(hdr)
     return {
-      isDate:  isDateCol(hdr),
-      isBool:  isBoolCol(hdr, s),
-      isEmail: isEmailCol(hdr),
-      isText:  isTextCat(hdr, colInfo),
-      isNum:   colInfo.dataType === 'numerical',
+      isId,
+      isDate:     !isId && isDateCol(hdr),
+      isBool:     !isId && isBoolCol(hdr, samp),
+      isEmail:    !isId && isEmailCol(hdr),
+      isNum:      !isId && (colInfo.dataType === 'numerical' || isNumericByName(hdr)),
+      isText:     !isId && isTextCat(hdr, colInfo),
+      semanticKey: !isId ? getSemanticMapKey(hdr) : null,
     }
   })
 
@@ -1063,28 +1110,35 @@ app.post('/api/datasets/:id/clean', async (c) => {
   let boolNormalized = 0
   let emailsInvalidated = 0
   let numericFormatFixed = 0
+  let semanticMapped = 0
 
   cleanedRows = cleanedRows.map((row: any[]) => {
     return row.map((v: any, ci: number) => {
+      // Always skip null/empty — they are handled in imputation
       if (v === null || v === undefined || String(v).trim() === '') return v
-      const p = colPlan[ci]
-      let val = String(v).trim() // always trim whitespace
 
-      // Date normalisation
+      const p = colPlan[ci]
+
+      // ID columns: only trim whitespace, never transform
+      if (p.isId) return String(v).trim()
+
+      let val = String(v).trim()
+
+      // Date normalisation — if parse fails, KEEP original (don't nullify)
       if (p.isDate) {
         const d = parseDate(val)
         if (d) { dateNormalized++; return d }
-        return null // unparseable date → null, will be imputed later
+        return val // keep original unparseable date — don't destroy data
       }
 
-      // Boolean normalisation
+      // Boolean normalisation — if not recognised, KEEP original
       if (p.isBool) {
         const b = normaliseBool(val)
         if (b !== null) { boolNormalized++; return b }
-        return null
+        return val // keep unrecognised value — don't destroy data
       }
 
-      // Email validation
+      // Email validation — nullify only truly malformed emails
       if (p.isEmail) {
         if (!isValidEmail(val)) { emailsInvalidated++; return null }
         return val.toLowerCase()
@@ -1097,11 +1151,19 @@ app.post('/api/datasets/:id/clean', async (c) => {
           if (String(val) !== String(n)) numericFormatFixed++
           return n
         }
-        return null // non-numeric in numeric col → null, imputed later
+        // BUG FIX: non-parseable in numeric col → null (imputed later), not kept as string
+        return null
       }
 
-      // Categorical text — title-case
-      if (p.isText && val.length < 80) {
+      // Semantic synonym mapping (PaymentMethod, Country, Gender, etc.)
+      if (p.semanticKey) {
+        const map = SEMANTIC_MAPS[p.semanticKey]
+        const canonical = map[val.toLowerCase()]
+        if (canonical) { if (canonical !== val) semanticMapped++; return canonical }
+      }
+
+      // Categorical text — title-case normalisation (NEVER returns null)
+      if (p.isText && val.length < 100) {
         const tc = toTitleCase(val)
         if (tc !== val) caseNormalized++
         return tc
