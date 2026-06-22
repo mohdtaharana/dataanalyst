@@ -23,19 +23,19 @@ function getApiKey(env: Bindings | undefined): string | undefined {
   
   // Try reading the local API key injected by Vite
   try {
-    const local = (typeof process !== 'undefined') ? (process as any).env?.LOCAL_POOLSIDE_API_KEY : undefined
+    const local = (typeof (globalThis as any).process !== 'undefined') ? (globalThis as any).process?.env?.LOCAL_POOLSIDE_API_KEY : undefined
     if (local) return local
   } catch {}
 
   // Fallback to process.env.POOLSIDE_API_KEY
   try {
-    const p = (typeof process !== 'undefined') ? (process as any).env?.POOLSIDE_API_KEY : undefined
+    const p = (typeof (globalThis as any).process !== 'undefined') ? (globalThis as any).process?.env?.POOLSIDE_API_KEY : undefined
     if (p) return p
   } catch {}
   
   // Fallback to direct fs read (only if running in pure Node.js)
   try {
-    const fs = (globalThis as any).require?.('fs') || require('fs')
+    const fs = (globalThis as any).require?.('fs') || (globalThis as any).require('fs')
     const raw = fs.readFileSync('.dev.vars', 'utf8')
     const match = raw.match(/POOLSIDE_API_KEY=(.+)/)
     if (match?.[1]) return match[1].trim()
@@ -651,7 +651,7 @@ app.post('/api/datasets/:id/chat', async (c) => {
     if (columnMatches.length > 0) {
       targetHeaders = columnMatches
       const indices = columnMatches.map((h: string) => dataset.headers.indexOf(h))
-      targetRows = dataset.rows.map((row: any[]) => indices.map(idx => row[idx]))
+      targetRows = dataset.rows.map((row: any[]) => indices.map((idx: number) => row[idx]))
     }
     
     let limit = dataset.rows.length
@@ -955,53 +955,83 @@ app.post('/api/datasets/:id/clean', async (c) => {
       .replace(/\b\w/g, (c: string) => c.toUpperCase())
   }
 
-  /** Normalise boolean representations → 'Yes' | 'No' */
+  // ─── HARDCODED BOOLEAN MAP (deterministic, never varies between runs) ───
+  const BOOL_TRUE  = new Set(['1','true','yes','y','t','on','active','enabled','correct','valid','present','positive'])
+  const BOOL_FALSE = new Set(['0','false','no','n','f','off','inactive','disabled','incorrect','invalid','absent','negative'])
+
+  /** Normalise boolean representations → 'Yes' | 'No' | null */
   function normaliseBool(v: any): string | null {
+    if (v === null || v === undefined || String(v).trim() === '') return null
     const s = String(v).trim().toLowerCase()
-    if (['1', 'true', 'yes', 'y'].includes(s)) return 'Yes'
-    if (['0', 'false', 'no', 'n'].includes(s)) return 'No'
+    if (BOOL_TRUE.has(s))  return 'Yes'
+    if (BOOL_FALSE.has(s)) return 'No'
     return null
   }
 
+  // ─── DETERMINISTIC DATE PARSER (covers all common formats, never varies) ───
   const MONTHS_SHORT: Record<string, string> = {
     jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',
     jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'
   }
 
-  /** Parse a messy date string → 'YYYY-MM-DD' or null */
+  /** Parse ANY messy date string → 'YYYY-MM-DD' or null */
   function parseDate(v: any): string | null {
-    if (!v) return null
+    if (v === null || v === undefined || String(v).trim() === '') return null
     const s = String(v).trim()
-    // Already ISO
-    let m = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/)
+
+    // 1. YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD
+    let m = s.match(/^(\d{4})[\/.\-](\d{1,2})[\/.\-](\d{1,2})$/)
     if (m) {
       const [, y, mo, d] = m
-      if (+mo < 1 || +mo > 12 || +d < 1 || +d > 31) return null
-      return `${y}-${mo.padStart(2,'0')}-${d.padStart(2,'0')}`
+      if (+mo >= 1 && +mo <= 12 && +d >= 1 && +d <= 31)
+        return `${y}-${mo.padStart(2,'0')}-${d.padStart(2,'0')}`
     }
-    // DD/MM/YYYY or DD-MM-YYYY
-    m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/)
-    if (m) {
-      const [, d, mo, y] = m
-      if (+mo < 1 || +mo > 12 || +d < 1 || +d > 31) return null
-      return `${y}-${mo.padStart(2,'0')}-${d.padStart(2,'0')}`
-    }
-    // MM-Mon-YYYY  e.g. 10-May-2024
-    m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/)
+
+    // 2. DD-Mon-YYYY / DD/Mon/YYYY  (e.g. 11-Oct-2025 or 11-October-2025)
+    m = s.match(/^(\d{1,2})[\/.\-]([A-Za-z]{3,9})[\/.\-](\d{4})$/)
     if (m) {
       const [, d, monStr, y] = m
-      const mo = MONTHS_SHORT[monStr.toLowerCase()]
-      if (!mo || +d < 1 || +d > 31) return null
-      return `${y}-${mo}-${d.padStart(2,'0')}`
+      const mo = MONTHS_SHORT[monStr.toLowerCase().slice(0,3)]
+      if (mo && +d >= 1 && +d <= 31)
+        return `${y}-${mo}-${String(+d).padStart(2,'0')}`
     }
-    // Mon DD, YYYY  e.g. May 10, 2024
-    m = s.match(/^([A-Za-z]{3})\s+(\d{1,2}),?\s+(\d{4})$/)
+
+    // 3. Mon DD, YYYY / Mon DD YYYY  (e.g. October 11, 2025)
+    m = s.match(/^([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})$/)
     if (m) {
       const [, monStr, d, y] = m
-      const mo = MONTHS_SHORT[monStr.toLowerCase()]
-      if (!mo) return null
-      return `${y}-${mo}-${d.padStart(2,'0')}`
+      const mo = MONTHS_SHORT[monStr.toLowerCase().slice(0,3)]
+      if (mo && +d >= 1 && +d <= 31)
+        return `${y}-${mo}-${String(+d).padStart(2,'0')}`
     }
+
+    // 4. MM-DD-YYYY / DD-MM-YYYY / MM/DD/YYYY / DD/MM/YYYY / dotted variants
+    m = s.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{4})$/)
+    if (m) {
+      const [, a, b, y] = m
+      const v1 = +a, v2 = +b
+      if (v1 > 12 && v2 <= 12)
+        return `${y}-${String(v2).padStart(2,'0')}-${String(v1).padStart(2,'0')}`
+      if (v2 > 12 && v1 <= 12)
+        return `${y}-${String(v1).padStart(2,'0')}-${String(v2).padStart(2,'0')}`
+      if (v1 <= 12 && v2 <= 12 && v1 >= 1 && v2 >= 1)
+        return `${y}-${String(v1).padStart(2,'0')}-${String(v2).padStart(2,'0')}`
+    }
+
+    // 5. Unix timestamps (10 = seconds, 13 = milliseconds)
+    if (/^\d{10}$/.test(s)) {
+      const d = new Date(+s * 1000)
+      if (!isNaN(d.getTime())) return d.toISOString().split('T')[0]
+    }
+    if (/^\d{13}$/.test(s)) {
+      const d = new Date(+s)
+      if (!isNaN(d.getTime())) return d.toISOString().split('T')[0]
+    }
+
+    // 6. Generic JS Date fallback (handles ISO strings, RFC 2822, etc.)
+    const ts = Date.parse(s)
+    if (!isNaN(ts)) return new Date(ts).toISOString().split('T')[0]
+
     return null
   }
 
@@ -1096,8 +1126,9 @@ app.post('/api/datasets/:id/clean', async (c) => {
     const isId = isIdCol(hdr)
     return {
       isId,
-      isDate:     !isId && isDateCol(hdr),
-      isBool:     !isId && isBoolCol(hdr, samp),
+      // Also use upload-detected dataType so columns detected as date/bool at parse time are ALWAYS normalised
+      isDate:     !isId && (isDateCol(hdr) || colInfo.dataType === 'date'),
+      isBool:     !isId && (isBoolCol(hdr, samp) || colInfo.dataType === 'boolean'),
       isEmail:    !isId && isEmailCol(hdr),
       isNum:      !isId && (colInfo.dataType === 'numerical' || isNumericByName(hdr)),
       isText:     !isId && isTextCat(hdr, colInfo),
@@ -1124,18 +1155,20 @@ app.post('/api/datasets/:id/clean', async (c) => {
 
       let val = String(v).trim()
 
-      // Date normalisation — if parse fails, KEEP original (don't nullify)
+      // Date normalisation — unparseable → null so imputation fills with valid YYYY-MM-DD
+      // This is DETERMINISTIC: parseDate always runs, result never depends on LLM output
       if (p.isDate) {
         const d = parseDate(val)
         if (d) { dateNormalized++; return d }
-        return val // keep original unparseable date — don't destroy data
+        return null // nullify so Step 6 imputes a valid date → 100% column consistency
       }
 
-      // Boolean normalisation — if not recognised, KEEP original
+      // Boolean normalisation — unrecognised → null so imputation fills with Yes/No
+      // This is HARDCODED: normaliseBool map never varies between runs
       if (p.isBool) {
         const b = normaliseBool(val)
         if (b !== null) { boolNormalized++; return b }
-        return val // keep unrecognised value — don't destroy data
+        return null // nullify so Step 6 imputes a valid bool → 100% column consistency
       }
 
       // Email validation — nullify only truly malformed emails
