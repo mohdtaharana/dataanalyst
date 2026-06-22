@@ -1780,6 +1780,14 @@ const App = {
     this.render()
   },
 
+  setTablePageSize(tableId, size) {
+    this.state.tableStates = this.state.tableStates || {}
+    this.state.tableStates[tableId] = this.state.tableStates[tableId] || { page: 1, search: '', pageSize: 5 }
+    this.state.tableStates[tableId].pageSize = parseInt(size, 10)
+    this.state.tableStates[tableId].page = 1
+    this.render()
+  },
+
   showToast(message, type = 'info') {
     const toast = document.createElement('div')
     toast.className = 'fixed top-4 right-4 z-50 px-6 py-3 rounded-lg shadow-lg fade-in ' + 
@@ -3018,7 +3026,8 @@ const App = {
     if (!tableData || !tableData.headers || !tableData.rows) return ''
     
     this.state.tableStates = this.state.tableStates || {}
-    const tState = this.state.tableStates[tableId] || { page: 1, search: '', pageSize: 5 }
+    const defaultPageSize = tableData.rows.length <= 50 ? tableData.rows.length : 10
+    const tState = this.state.tableStates[tableId] || { page: 1, search: '', pageSize: defaultPageSize }
     this.state.tableStates[tableId] = tState
     
     const searchQuery = tState.search.toLowerCase().trim()
@@ -3079,7 +3088,24 @@ const App = {
     html += '</div>'
     
     // Pagination footer
-    html += '<div class="flex items-center justify-between text-[10px] text-dark-400 pt-1">'
+    html += '<div class="flex items-center justify-between text-[10px] text-dark-400 pt-1 flex-wrap gap-2">'
+    
+    // Page size dropdown
+    html += '<div class="flex items-center gap-1.5">'
+    html += '<span>Show:</span>'
+    html += '<select onchange="App.setTablePageSize(\\\'' + tableId + '\\\', this.value)" class="bg-dark-900 border border-white/10 rounded px-1 text-[9px] text-white focus:outline-none focus:border-primary-500 transition-colors">'
+    const sizes = [5, 10, 20, 50, 100]
+    if (!sizes.includes(tState.pageSize)) {
+      sizes.push(tState.pageSize)
+      sizes.sort((a, b) => a - b)
+    }
+    sizes.forEach(sz => {
+      const sel = tState.pageSize === sz ? 'selected' : ''
+      html += '<option value="' + sz + '" ' + sel + '>' + sz + '</option>'
+    })
+    html += '</select>'
+    html += '</div>'
+
     html += '<span>Page ' + tState.page + ' of ' + totalPages + '</span>'
     html += '<div class="flex items-center gap-1">'
     
