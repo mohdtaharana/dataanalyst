@@ -2157,6 +2157,34 @@ const App = {
     this.render()
   },
 
+  downloadCSV() {
+    const d = this.state.dataset
+    if (!d) return
+    const { headers, rows } = d
+    const NL = String.fromCharCode(10)
+    
+    const csvHeaders = (headers || []).map(h => '"' + String(h).replace(/"/g, '""') + '"').join(',')
+    const csvRows = (rows || []).map(row => (row || []).map(val => {
+      if (val === null || val === undefined) return ''
+      const str = String(val)
+      if (str.includes(',') || str.includes('"') || str.includes(NL) || str.includes(String.fromCharCode(13))) {
+        return '"' + str.replace(/"/g, '""') + '"'
+      }
+      return str
+    }).join(',')).join(NL)
+    
+    const csvContent = csvHeaders + NL + csvRows
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' })
+    const link = document.createElement('a')
+    const url = URL.createObjectURL(blob)
+    link.setAttribute('href', url)
+    link.setAttribute('download', d.fileName || 'data.csv')
+    link.style.visibility = 'hidden'
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+  },
+
   downloadFilteredCSV() {
     const d = this.state.dataset
     if (!d) return
@@ -2326,7 +2354,7 @@ const App = {
       \${this.state.sidebarOpen ? \`<div onclick="App.toggleSidebar(event)" class="md:hidden fixed inset-0 bg-dark-950/60 backdrop-blur-sm z-30 transition-opacity"></div>\` : ''}
 
       <!-- Sidebar -->
-      <aside class="sidebar w-64 h-screen glass border-r border-white/5 flex-col overflow-y-auto \${this.state.sidebarOpen ? 'fixed left-0 top-0 z-40 flex' : 'hidden'} md:fixed md:flex">
+      <aside class="sidebar w-64 h-screen glass border-r border-white/5 flex-col overflow-y-auto \${this.state.sidebarOpen ? 'fixed left-0 top-0 z-[60] flex' : 'hidden'} md:fixed md:flex md:z-40">
         <div class="p-5 border-b border-white/5 flex items-center justify-between">
           <div class="flex items-center gap-3">
             <div class="w-9 h-9 rounded-lg bg-gradient-to-br from-primary-500 to-purple-600 flex items-center justify-center">
@@ -2927,9 +2955,9 @@ const App = {
            : 
             '<span class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-green-500/10 text-green-400 border border-green-500/20 flex items-center gap-1.5"><i class="fas fa-circle-check"></i> Cleaned</span>'
           }
-          <a href="/api/datasets/\${d.id}/download/csv" download class="px-4 py-2 rounded-lg text-sm font-medium bg-dark-800 text-white hover:bg-dark-700 transition-colors border border-white/5 flex items-center gap-2">
+          <button onclick="App.downloadCSV()" class="px-4 py-2 rounded-lg text-sm font-medium bg-dark-800 text-white hover:bg-dark-700 transition-colors border border-white/5 flex items-center gap-2">
             <i class="fas fa-file-csv"></i> Download CSV
-          </a>
+          </button>
           <button onclick="App.downloadPDFReport()" class="px-4 py-2 rounded-lg text-sm font-medium bg-dark-800 text-white hover:bg-dark-700 transition-colors border border-white/5 flex items-center gap-2">
             <i class="fas fa-file-pdf"></i> Download PDF Report
           </button>
