@@ -52,6 +52,94 @@ function generateId(): string {
   return crypto.randomUUID()
 }
 
+/**
+ * Recognise the common ways a "missing" value appears in real-world data
+ * (empty, null, NaN, N/A, -, unknown, none, etc.). The cleaning pipeline
+ * must treat ALL of these as null — previously only ''/null/'null'/'nan'
+ * were caught, so sentinel strings like "N/A" survived as fake categories
+ * and were never imputed.
+ */
+function isMissingValue(v: any): boolean {
+  if (v === null || v === undefined) return true
+  if (typeof v === 'number' && isNaN(v)) return true
+  const s = String(v).trim().toLowerCase()
+  if (s === '') return true
+  return new Set([
+    'null', 'nan', 'n/a', 'na', 'n.a', 'n a', '-', '--', '—', '–',
+    'none', 'nil', 'nill', 'not available', 'unavailable', 'missing',
+    'undefined', 'unknown', 'not specified', 'not applicable', 'no data',
+    'tbd', 'to be determined', '?', '...', 'nill',
+  ]).has(s)
+}
+
+/** Lowercase + strip punctuation — used for alias/fuzzy category matching */
+function normalizeKey(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]/g, '')
+}
+
+/** Levenshtein edit distance (typo-tolerant category matching) */
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0
+  if (a.length === 0) return b.length
+  if (b.length === 0) return a.length
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i)
+  for (let i = 1; i <= a.length; i++) {
+    let diag = prev[0]
+    prev[0] = i
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = prev[j]
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diag + (a[i - 1] === b[j - 1] ? 0 : 1))
+      diag = tmp
+    }
+  }
+  return prev[b.length]
+}
+
+/**
+ * Number of decimal places in a number, measured from its shortest string
+ * representation ("29.99" → 2, "12.999" → 3, "1492" → 0). Used to detect
+ * precision-anomalous values ("12.999" in a 2-decimal price column) so they
+ * can be trimmed back to the column's dominant precision.
+ */
+function decimalPlaces(n: number): number {
+  if (!isFinite(n)) return 0
+  const s = String(n)
+  if (s.indexOf('e') !== -1 || s.indexOf('E') !== -1) return 0
+  const dot = s.indexOf('.')
+  return dot === -1 ? 0 : s.length - dot - 1
+}
+
+/**
+ * Build a normalized alias index (stripped-case key → canonical label).
+ * Built ONCE per semantic column, then reused for every cell.
+ */
+function buildCategoryIndex(aliases: Record<string, string>): Map<string, string> {
+  const index = new Map<string, string>()
+  for (const [alias, canonical] of Object.entries(aliases)) {
+    index.set(normalizeKey(alias), canonical)
+  }
+  return index
+}
+
+/**
+ * Map a messy category value → canonical label using a prebuilt index.
+ * Exact alias match first, then edit-distance ≤ 2 for typos
+ * (Marketting → Marketing). Returns null when unrecognised.
+ */
+function matchCategory(value: string, index: Map<string, string>): string | null {
+  const nv = normalizeKey(value)
+  if (!nv) return null
+  if (index.has(nv)) return index.get(nv) as string
+  let best: string | null = null
+  let bestDist = Infinity
+  for (const [alias, canonical] of index) {
+    if (nv.length < 4 || alias.length < 4) continue
+    const d = levenshtein(nv, alias)
+    if (d < bestDist) { bestDist = d; best = canonical }
+  }
+  return bestDist <= 2 ? best : null
+}
+
 function detectDataType(values: any[]): string {
   const sample = values.filter(v => v !== null && v !== undefined && v !== '').slice(0, 100)
   if (sample.length === 0) return 'unknown'
@@ -155,30 +243,111 @@ function calculateCorrelation(x: number[], y: number[]): number {
   return den === 0 ? 0 : Math.round((num / den) * 1000) / 1000
 }
 
+/**
+ * Configurable per-column DOMAIN rules (applied by header ROLE keyword, never
+ * by a specific column name). Any numeric value outside these bounds is an
+ * outlier and gets nullified then median-imputed during cleaning.
+ */
+const DOMAIN_RULES: Record<string, { min: number; max: number }> = {
+  age:       { min: 1,   max: 120 }, // Age 0 is invalid for a person
+  rating:    { min: 1,   max: 5   },
+  discount:  { min: 0,   max: 100 },
+  quantity:  { min: 1,   max: 999 },
+  price:     { min: 0,   max: Infinity },
+  salary:    { min: 0,   max: Infinity },
+  score:     { min: 0,   max: 100 },
+}
+
+/** Look up the domain rule for a header by role keyword (generic). */
+function getDomainRule(hdr: string): { min: number; max: number } | null {
+  const key = Object.keys(DOMAIN_RULES).find(k => hdr.toLowerCase().includes(k))
+  return key ? DOMAIN_RULES[key] : null
+}
+
+/**
+ * Honest data-quality score, recomputed live from the CURRENT state of the
+ * rows. Penalises:
+ *   1. Missing-value sentinels per cell
+ *   2. Duplicate values in identifier columns (not just full-row dups)
+ *   3. Categorical uniqueness that GREW vs. before cleaning (merges can only
+ *      reduce it — if it went up, something fabricated new categories)
+ *   4. Numerical values outside configured domain bounds
+ * Only shows 100% when all four checks genuinely pass.
+ */
+function computeDataQualityScore(
+  data: any[][],
+  headers: string[],
+  columnAnalysis: any[],
+  preCleanUnique?: number[]
+): number {
+  if (data.length === 0 || headers.length === 0) return 0
+  const totalCells = data.length * headers.length
+  let issues = 0
+
+  columnAnalysis.forEach((col: any, idx: number) => {
+    const values = data.map(r => r[idx])
+
+    // 1. Missing sentinels
+    for (const v of values) if (isMissingValue(v)) issues++
+
+    // 2. Duplicate identifier values (email/phone/id …) — duplicates within
+    //    a unique key are data-integrity issues even if rows are not full dups.
+    if (col.isIdentifier) {
+      const freq = new Map<string, number>()
+      for (const v of values) {
+        if (!isMissingValue(v)) {
+          const s = String(v).toLowerCase().trim()
+          freq.set(s, (freq.get(s) || 0) + 1)
+        }
+      }
+      for (const n of freq.values()) if (n > 1) issues += (n - 1)
+    }
+
+    // 3. Category uniqueness must never grow after cleaning
+    if (preCleanUnique && !col.isIdentifier && col.dataType !== 'numerical' && col.dataType !== 'date') {
+      const post = new Set(values.filter(v => !isMissingValue(v)).map(String)).size
+      if (post > (preCleanUnique[idx] || 0)) issues += (post - preCleanUnique[idx])
+    }
+
+    // 4. Outliers vs. configured domain bounds
+    if (col.dataType === 'numerical') {
+      const rule = getDomainRule(col.name)
+      if (rule) {
+        for (const v of values) {
+          if (!isMissingValue(v)) {
+            const n = Number(v)
+            if (!isNaN(n) && (n < rule.min || n > rule.max)) issues++
+          }
+        }
+      }
+    }
+  })
+
+  // Only 100% when every check genuinely passes. If ANY issue remains the
+  // score is capped at 99 — a 100% must never hide lingering problems
+  // (rounding a small penalty like 99.78 → 100 made big datasets look
+  // perfect while suggestions still listed issues).
+  const raw = Math.max(0, Math.round((1 - issues / totalCells) * 100))
+  return issues > 0 ? Math.min(raw, 99) : raw
+}
+
+// Legacy alias kept for the old call sites that only count missing values.
 function getDataQualityScore(data: any[][], columns: string[]): number {
   if (data.length === 0) return 0
   let totalCells = data.length * columns.length
   let issues = 0
-  
+
   for (const row of data) {
     for (let i = 0; i < columns.length; i++) {
-      const val = row[i]
-      if (val === null || val === undefined || val === '') {
-        issues++
-      } else {
-        const s = String(val).trim().toLowerCase()
-        if (s === 'null' || s === 'nan' || s === 'undefined') {
-          issues++
-        }
-      }
+      if (isMissingValue(row[i])) issues++
     }
   }
-  
+
   return Math.round((1 - issues / totalCells) * 100)
 }
 
-// ============ CSV PARSER ============
-function parseCSV(text: string): { headers: string[]; rows: any[][] } {
+// ============ CSV/TSV PARSER ============
+function parseCSV(text: string, delimiter = ','): { headers: string[]; rows: any[][] } {
   const lines = text.split(/\r?\n/).filter(l => l.trim())
   if (lines.length === 0) return { headers: [], rows: [] }
   
@@ -190,7 +359,7 @@ function parseCSV(text: string): { headers: string[]; rows: any[][] } {
       if (ch === '"') {
         if (inQuotes && line[i+1] === '"') { current += '"'; i++ }
         else inQuotes = !inQuotes
-      } else if (ch === ',' && !inQuotes) {
+      } else if (ch === delimiter && !inQuotes) {
         result.push(current.trim()); current = ''
       } else {
         current += ch
@@ -201,7 +370,14 @@ function parseCSV(text: string): { headers: string[]; rows: any[][] } {
   }
   
   const headers = parseLine(lines[0])
-  const rows = lines.slice(1).map(l => parseLine(l))
+  const rows = lines.slice(1).map(l => parseLine(l)).map(r => {
+    // Normalize row width to match headers: truncate extra cells (e.g. from
+    // trailing/extra commas) and pad missing cells with ''. Otherwise ragged
+    // rows crash later code that indexes columns positionally (clean pipeline).
+    if (r.length > headers.length) return r.slice(0, headers.length)
+    while (r.length < headers.length) r.push('')
+    return r
+  })
   return { headers, rows }
 }
 
@@ -285,14 +461,18 @@ app.post('/api/upload', async (c) => {
       return c.json({ error: 'No file provided' }, 400)
     }
     
-    const text = await file.text()
+    const text = (await file.text()).replace(/^\uFEFF/, '') // strip UTF-8 BOM
     const fileName = file.name.toLowerCase()
     
     let headers: string[] = []
     let rows: any[][] = []
     
-    if (fileName.endsWith('.csv') || fileName.endsWith('.tsv')) {
+    if (fileName.endsWith('.csv')) {
       const parsed = parseCSV(text)
+      headers = parsed.headers
+      rows = parsed.rows
+    } else if (fileName.endsWith('.tsv')) {
+      const parsed = parseCSV(text, '\t')
       headers = parsed.headers
       rows = parsed.rows
     } else if (fileName.endsWith('.json')) {
@@ -308,10 +488,32 @@ app.post('/api/upload', async (c) => {
     const columnAnalysis = headers.map((header, idx) => {
       const values = rows.map(r => r[idx])
       const dataType = detectDataType(values)
-      const nonNull = values.filter(v => v !== null && v !== undefined && v !== '')
+      const nonNull = values.filter(v => !isMissingValue(v))
       const uniqueValues = new Set(nonNull.map(String)).size
       const nullCount = values.length - nonNull.length
-      
+      const nonNullCount = nonNull.length
+      // Identifier sub-type (Email, PhoneNumber, EmployeeID, …): EITHER the
+      // header looks like an id/email/phone/code column (generic patterns),
+      // OR the data is code-like text with >95% unique values.
+      // IMPORTANT: date and numerical columns (Date of Birth, Salary, Age,
+      // Score …) are NEVER identifiers — people CAN share a birth date or
+      // salary, so those duplicates are normal data, not integrity issues.
+      // Same for name/date-like headers even if stored as text.
+      const hdrWords = header.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[^a-z0-9]+/gi, ' ').toLowerCase()
+      const headerMatchesId =
+        /\bid\b|\bcode\b|\buuid\b/.test(hdrWords) ||
+        /\bemail\b|\bmail\b/.test(hdrWords) ||
+        /\bphone\b|\bmobile\b|\btelephone\b|\bcell\b|\bcontact/.test(hdrWords)
+      const notPlainValueCol = dataType !== 'date' && dataType !== 'numerical' && dataType !== 'boolean' &&
+        !/\b(date|dob|birth|year|age|salary|price|amount|cost|income|revenue|score|rating|quantity|count|name)\b/.test(hdrWords)
+      const dataBasedUnique = nonNullCount > 0 && uniqueValues / nonNullCount > 0.95 && notPlainValueCol
+      const isIdentifier = headerMatchesId || dataBasedUnique
+      // Count of duplicated non-missing values (n-1 per value seen n times)
+      const freq = new Map<string, number>()
+      nonNull.forEach(v => freq.set(String(v).toLowerCase().trim(), (freq.get(String(v).toLowerCase().trim()) || 0) + 1))
+      let duplicateValues = 0
+      for (const n of freq.values()) if (n > 1) duplicateValues += (n - 1)
+
       return {
         name: header,
         index: idx,
@@ -319,6 +521,9 @@ app.post('/api/upload', async (c) => {
         uniqueValues,
         nullCount,
         nullPercent: Math.round((nullCount / values.length) * 10000) / 100,
+        nonNullCount,
+        isIdentifier,
+        duplicateValues,
         sampleValues: nonNull.slice(0, 5).map(String)
       }
     })
@@ -330,8 +535,8 @@ app.post('/api/upload', async (c) => {
       numericalStats[col.name] = calculateStats(values)
     })
     
-    // Data quality
-    const qualityScore = getDataQualityScore(rows, headers)
+    // Data quality (honest: missing + duplicate identifiers + domain outliers)
+    const qualityScore = computeDataQualityScore(rows, headers, columnAnalysis)
     
     // Duplicate detection
     const rowStrings = rows.map(r => JSON.stringify(r))
@@ -873,8 +1078,11 @@ app.get('/api/datasets/:id/cleaning', async (c) => {
   // Missing values
   for (const col of columnAnalysis) {
     if (col.nullCount > 0) {
-      const strategy = col.dataType === 'numerical' ? 'mean/median imputation' :
-                       col.dataType === 'categorical' ? 'mode imputation' : 'forward fill'
+      const strategy = col.isIdentifier ? 'unique per-row placeholder (never a shared constant — avoids duplicate keys)' :
+                       col.dataType === 'numerical' ? 'median imputation' :
+                       col.dataType === 'date' ? 'left as missing (no meaningful average for dates)' :
+                       col.dataType === 'categorical' ? 'mode imputation (only if low-cardinality)' :
+                       'left as missing (high-cardinality text has no meaningful mode)'
       suggestions.push({
         type: 'missing_values',
         column: col.name,
@@ -894,14 +1102,24 @@ app.get('/api/datasets/:id/cleaning', async (c) => {
       recommendation: 'Remove duplicate rows to ensure data integrity'
     })
   }
-  
-  // Outliers — skip for bounded/discrete columns (same logic as
-  // the cleaning pipeline's BOUNDED_COLUMNS set)
-  const isBoundedCol = (name: string) =>
-    ['quantity', 'rating', 'discount', 'score'].some(k => name.toLowerCase().includes(k))
 
+  // Duplicate values inside identifier columns (email/phone/id) — data
+  // integrity issue even when the full rows differ.
+  for (const col of columnAnalysis) {
+    if (col.isIdentifier && col.duplicateValues > 0) {
+      suggestions.push({
+        type: 'duplicate_identifiers',
+        column: col.name,
+        severity: 'high',
+        issue: `${col.duplicateValues} duplicate values in identifier column '${col.name}'`,
+        recommendation: 'Each row must have a unique identifier value — investigate the duplicate sources before cleaning'
+      })
+    }
+  }
+
+  // Outliers — every numerical column (domain rules + IQR handle bounded
+  // columns separately inside the pipeline)
   for (const col of columnAnalysis.filter((c: any) => c.dataType === 'numerical')) {
-    if (isBoundedCol(col.name)) continue
     const stats = dataset.numericalStats[col.name]
     if (stats && stats.outlierPercent > 2) {
       suggestions.push({
@@ -909,17 +1127,17 @@ app.get('/api/datasets/:id/cleaning', async (c) => {
         column: col.name,
         severity: stats.outlierPercent > 10 ? 'high' : 'medium',
         issue: `${stats.outlierCount} outliers detected (${stats.outlierPercent}%)`,
-        recommendation: 'Review outliers - consider winsorization, capping, or removal based on domain knowledge'
+        recommendation: 'Review outliers - nullify + median-impute domain violations, cap the rest with IQR bounds'
       })
     }
   }
   
-  // High cardinality — skip columns that look like IDs
+  // High cardinality — skip columns that look like IDs or detected identifiers
   const isIdLike = (name: string) => /(?:id|uuid|guid|code|key)/i.test(name)
 
   for (const col of columnAnalysis) {
     if (col.dataType === 'text' && col.uniqueValues > rows.length * 0.9 &&
-        !isIdLike(col.name)) {
+        !isIdLike(col.name) && !col.isIdentifier) {
       suggestions.push({
         type: 'high_cardinality',
         column: col.name,
@@ -942,6 +1160,7 @@ app.get('/api/datasets/:id/cleaning', async (c) => {
 
 // Clean dataset — comprehensive production-grade pipeline
 app.post('/api/datasets/:id/clean', async (c) => {
+  try {
   const id = c.req.param('id')
   const dataset = datasets.get(id)
   if (!dataset) return c.json({ error: 'Dataset not found' }, 404)
@@ -963,11 +1182,13 @@ app.post('/api/datasets/:id/clean', async (c) => {
     return parseFloat(s)
   }
 
-  /** Normalise text: trim + title-case first letter per word */
+  /** Normalise text: trim + title-case first letter per word.
+   *  Word starts are spaces/hyphens/brackets — NOT apostrophes, so
+   *  "master's" → "Master's" (previously became "Master'S"). */
   function toTitleCase(s: string): string {
     return s.trim()
       .toLowerCase()
-      .replace(/\b\w/g, (c: string) => c.toUpperCase())
+      .replace(/(^|[\s\-\(\[\{"])[a-z]/g, (m: string) => m.toUpperCase())
   }
 
   // ─── HARDCODED BOOLEAN MAP (deterministic, never varies between runs) ───
@@ -989,17 +1210,24 @@ app.post('/api/datasets/:id/clean', async (c) => {
     jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'
   }
 
-  /** Parse ANY messy date string → 'YYYY-MM-DD' or null */
-  function parseDate(v: any): string | null {
-    if (v === null || v === undefined || String(v).trim() === '') return null
-    const s = String(v).trim()
-
+  /**
+   * Structured date parse — returns the SAME fields for a given string every
+   * time. When a numeric date is ambiguous (both parts ≤ 12) it exposes both
+   * interpretations so the caller can resolve it with column context instead
+   * of guessing.
+   */
+  function parseDateStruct(s: string): {
+    canonical: string | null
+    ambiguous: boolean
+    dayFirstCanon: string | null
+    monthFirstCanon: string | null
+  } | null {
     // 1. YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD
     let m = s.match(/^(\d{4})[\/.\-](\d{1,2})[\/.\-](\d{1,2})$/)
     if (m) {
       const [, y, mo, d] = m
       if (+mo >= 1 && +mo <= 12 && +d >= 1 && +d <= 31)
-        return `${y}-${mo.padStart(2,'0')}-${d.padStart(2,'0')}`
+        return { canonical: `${y}-${mo.padStart(2,'0')}-${d.padStart(2,'0')}`, ambiguous: false, dayFirstCanon: null, monthFirstCanon: null }
     }
 
     // 2. DD-Mon-YYYY / DD/Mon/YYYY  (e.g. 11-Oct-2025 or 11-October-2025)
@@ -1008,7 +1236,7 @@ app.post('/api/datasets/:id/clean', async (c) => {
       const [, d, monStr, y] = m
       const mo = MONTHS_SHORT[monStr.toLowerCase().slice(0,3)]
       if (mo && +d >= 1 && +d <= 31)
-        return `${y}-${mo}-${String(+d).padStart(2,'0')}`
+        return { canonical: `${y}-${mo}-${String(+d).padStart(2,'0')}`, ambiguous: false, dayFirstCanon: null, monthFirstCanon: null }
     }
 
     // 3. Mon DD, YYYY / Mon DD YYYY  (e.g. October 11, 2025)
@@ -1017,7 +1245,7 @@ app.post('/api/datasets/:id/clean', async (c) => {
       const [, monStr, d, y] = m
       const mo = MONTHS_SHORT[monStr.toLowerCase().slice(0,3)]
       if (mo && +d >= 1 && +d <= 31)
-        return `${y}-${mo}-${String(+d).padStart(2,'0')}`
+        return { canonical: `${y}-${mo}-${String(+d).padStart(2,'0')}`, ambiguous: false, dayFirstCanon: null, monthFirstCanon: null }
     }
 
     // 4. MM-DD-YYYY / DD-MM-YYYY / MM/DD/YYYY / DD/MM/YYYY / dotted variants
@@ -1025,29 +1253,57 @@ app.post('/api/datasets/:id/clean', async (c) => {
     if (m) {
       const [, a, b, y] = m
       const v1 = +a, v2 = +b
-      if (v1 > 12 && v2 <= 12)
-        return `${y}-${String(v2).padStart(2,'0')}-${String(v1).padStart(2,'0')}`
-      if (v2 > 12 && v1 <= 12)
-        return `${y}-${String(v1).padStart(2,'0')}-${String(v2).padStart(2,'0')}`
-      if (v1 <= 12 && v2 <= 12 && v1 >= 1 && v2 >= 1)
-        return `${y}-${String(v1).padStart(2,'0')}-${String(v2).padStart(2,'0')}`
+      const dayFirst = `${y}-${String(v2).padStart(2,'0')}-${String(v1).padStart(2,'0')}`
+      const monthFirst = `${y}-${String(v1).padStart(2,'0')}-${String(v2).padStart(2,'0')}`
+      if (v1 > 12 && v2 <= 12 && v1 <= 31)
+        return { canonical: dayFirst, ambiguous: false, dayFirstCanon: dayFirst, monthFirstCanon: null }
+      if (v2 > 12 && v1 <= 12 && v2 <= 31)
+        return { canonical: monthFirst, ambiguous: false, dayFirstCanon: null, monthFirstCanon: monthFirst }
+      if (v1 >= 1 && v2 >= 1)
+        // AMBIGUOUS (both parts ≤ 12): "05/01/2024" is 5 Jan OR 1 May.
+        // Never guess here — parseDate() resolves it with column context:
+        // whichever interpretation already exists in the column wins, else the
+        // column's dominant format, else day-first (international DD/MM/YYYY).
+        return { canonical: null, ambiguous: true, dayFirstCanon: dayFirst, monthFirstCanon: monthFirst }
     }
 
     // 5. Unix timestamps (10 = seconds, 13 = milliseconds)
     if (/^\d{10}$/.test(s)) {
       const d = new Date(+s * 1000)
-      if (!isNaN(d.getTime())) return d.toISOString().split('T')[0]
+      if (!isNaN(d.getTime())) return { canonical: d.toISOString().split('T')[0], ambiguous: false, dayFirstCanon: null, monthFirstCanon: null }
     }
     if (/^\d{13}$/.test(s)) {
       const d = new Date(+s)
-      if (!isNaN(d.getTime())) return d.toISOString().split('T')[0]
+      if (!isNaN(d.getTime())) return { canonical: d.toISOString().split('T')[0], ambiguous: false, dayFirstCanon: null, monthFirstCanon: null }
     }
 
     // 6. Generic JS Date fallback (handles ISO strings, RFC 2822, etc.)
     const ts = Date.parse(s)
-    if (!isNaN(ts)) return new Date(ts).toISOString().split('T')[0]
+    if (!isNaN(ts)) return { canonical: new Date(ts).toISOString().split('T')[0], ambiguous: false, dayFirstCanon: null, monthFirstCanon: null }
 
     return null
+  }
+
+  /**
+   * Parse ANY messy date string → 'YYYY-MM-DD' or null.
+   * ctx carries the column's already-known dates + format votes so ambiguous
+   * values like "05/01/2024" resolve to the interpretation the column ACTUALLY
+   * uses (e.g. 2024-01-05 when 2024-01-05 already exists elsewhere).
+   */
+  function parseDate(v: any, ctx?: { knownDates: Set<string>; dayVotes: number; monthVotes: number }): string | null {
+    if (v === null || v === undefined || String(v).trim() === '') return null
+    const p = parseDateStruct(String(v).trim())
+    if (!p) return null
+    if (!p.ambiguous) return p.canonical
+    if (ctx) {
+      const mKnown = p.monthFirstCanon ? ctx.knownDates.has(p.monthFirstCanon) : false
+      const dKnown = p.dayFirstCanon ? ctx.knownDates.has(p.dayFirstCanon) : false
+      if (mKnown && !dKnown) return p.monthFirstCanon
+      if (dKnown && !mKnown) return p.dayFirstCanon
+      if (ctx.monthVotes > ctx.dayVotes) return p.monthFirstCanon
+      if (ctx.dayVotes > ctx.monthVotes) return p.dayFirstCanon
+    }
+    return p.dayFirstCanon
   }
 
   /** Validate email — basic RFC check */
@@ -1088,9 +1344,16 @@ app.post('/api/datasets/:id/clean', async (c) => {
   // STEP 2 — Per-column type detection & normalisation pass
   // ─────────────────────────────────────────────────────────────
 
-  // BUG FIX: was matching "order" → clobbered OrderID, OrderStatus
-  const isDateCol = (hdr: string) =>
-    /\bdate\b|\btime\b|created_at|updated_at|purchased_at/i.test(hdr)
+  // BUG FIX: was matching "order" → clobbered OrderID, OrderStatus.
+  // Normalise camelCase/snake_case/pascalCase headers into space-separated
+  // lowercase words so \b anchors work on names like OrderDate, createdAt.
+  const toWords = (s: string) =>
+    s.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[^a-z0-9]+/gi, ' ').toLowerCase()
+
+  const isDateCol = (hdr: string) => {
+    const w = toWords(hdr)
+    return /\bdate\b|\btime\b|timestamp|\b(?:created|updated|purchased|deleted|occurred)(?:\s*(?:at|on))?\b/i.test(w)
+  }
 
   // BUG FIX: return false if samples empty (avoids vacuous truth in [].every())
   const isBoolCol = (_hdr: string, samp: any[]) => {
@@ -1100,19 +1363,33 @@ app.post('/api/datasets/:id/clean', async (c) => {
     return uniq.every(u => boolSet.has(u))
   }
 
-  const isEmailCol = (hdr: string) => /\bemail\b|\bmail\b/i.test(hdr)
+  const isEmailCol = (hdr: string) => /\bemail\b|\bmail\b/i.test(toWords(hdr))
+
+  // Phone/mobile/contact-number columns — unique identifiers, never fill
+  // with a constant (that would create duplicate phone numbers).
+  const isPhoneCol = (hdr: string) =>
+    /\bphone\b|\bmobile\b|\btelephone\b|\bcellphone\b|\bcell\b|\bcontact\s*(?:number|no|#|phone|cell|mobile)\b/i.test(toWords(hdr))
 
   // BUG FIX: columns whose name contains id/code/uuid are identifiers — skip ALL transforms
-  const isIdCol = (hdr: string) => /\bid\b|_id$|^id_/i.test(hdr)
+  const isIdCol = (hdr: string) => /\bid\b|\bcode\b|\buuid\b|_id$|^id_/i.test(toWords(hdr))
 
   // BUG FIX: detect price/amount/cost/salary columns by NAME regardless of upload-detected type
   const isNumericByName = (hdr: string) =>
-    /\bprice\b|\bamount\b|\bcost\b|\brevenue\b|\bfee\b|\bsalary\b|\btax\b|\btotal\b|\bsubtotal\b|\bincome\b/i.test(hdr)
+    /\bprice\b|\bamount\b|\bcost\b|\brevenue\b|\bfee\b|\bsalary\b|\btax\b|\btotal\b|\bsubtotal\b|\bincome\b/i.test(toWords(hdr))
 
+  // Free-text columns where title-casing would corrupt meaning (notes,
+  // addresses, comments, reviews, etc.) — leave them untouched.
+  const FREEFORM_COLS = /\bcomment\b|\bnote\b|\bnotes\b|\bdescription\b|\bmessage\b|\baddress\b|\breview\b|\bfeedback\b|\bremark\b|\bremarks\b|\bcontent\b|\bsummary\b|\bbody\b|\btext\b|\breason\b|\bcomplaint\b/i
+
+  // Title-case categorical AND text columns (fixes all-caps names like
+  // "SOPHIA BROWN"), but never id/date/email/phone/freeform columns.
   const isTextCat = (hdr: string, colInfo: any) =>
-    colInfo.dataType === 'categorical' && !isIdCol(hdr) && !isDateCol(hdr)
+    (colInfo.dataType === 'categorical' || colInfo.dataType === 'text') &&
+    !isIdCol(hdr) && !isDateCol(hdr) && !FREEFORM_COLS.test(toWords(hdr))
 
-  // Semantic synonym maps — normalise equivalent labels to one canonical value
+  // Semantic synonym maps — normalise equivalent labels to one canonical value.
+  // Matched by header (paymentmethod/country/gender/department/educationlevel),
+  // then exact + fuzzy (typo-tolerant) alias matching via canonicalizeCategory.
   const SEMANTIC_MAPS: Record<string, Record<string, string>> = {
     paymentmethod: {
       'cod': 'Cash On Delivery', 'c.o.d': 'Cash On Delivery', 'cash on delivery': 'Cash On Delivery', 'cash': 'Cash On Delivery',
@@ -1134,7 +1411,118 @@ app.post('/api/datasets/:id/clean', async (c) => {
     gender: {
       'm': 'Male', 'male': 'Male',
       'f': 'Female', 'female': 'Female',
-      'other': 'Other', 'non-binary': 'Other',
+      'other': 'Other', 'non-binary': 'Other', 'non binary': 'Other',
+      'unspecified': 'Other', 'not specified': 'Other', 'prefer not to say': 'Other',
+      'prefer not to answer': 'Other', 'rather not say': 'Other', 'unknown': 'Other',
+    },
+    department: {
+      // Finance
+      'finance': 'Finance', 'finances': 'Finance', 'fin': 'Finance',
+      'accounting': 'Finance', 'account': 'Finance', 'accounts': 'Finance',
+      'financial': 'Finance', 'finance dept': 'Finance', 'fin dept': 'Finance',
+      'bookkeeping': 'Finance', 'payroll': 'Finance', 'audit': 'Finance',
+      // HR
+      'hr': 'Human Resources', 'human resources': 'Human Resources', 'human resource': 'Human Resources',
+      'personnel': 'Human Resources', 'people operations': 'Human Resources',
+      'talent': 'Human Resources', 'talent acquisition': 'Human Resources', 'recruitment': 'Human Resources',
+      'hr dept': 'Human Resources', 'h r': 'Human Resources',
+      // IT
+      'it': 'IT', 'information technology': 'IT', 'info tech': 'IT', 'information tech': 'IT',
+      'technology': 'IT', 'tech': 'IT', 'it dept': 'IT', 'it department': 'IT',
+      'infotech': 'IT', 'it services': 'IT', 'tech services': 'IT', 'it support': 'IT', 'technical': 'IT',
+      // Marketing
+      'marketing': 'Marketing', 'marketting': 'Marketing', 'mktg': 'Marketing',
+      'mkt': 'Marketing', 'marketing dept': 'Marketing', 'marketing department': 'Marketing',
+      'branding': 'Marketing', 'brand': 'Marketing', 'digital marketing': 'Marketing', 'social media': 'Marketing',
+      // Sales
+      'sales': 'Sales', 'sales dept': 'Sales', 'sales department': 'Sales',
+      'business development': 'Sales', 'bizdev': 'Sales', 'bd': 'Sales', 'key accounts': 'Sales', 'sales and marketing': 'Sales',
+      // Engineering
+      'engineering': 'Engineering', 'engg': 'Engineering', 'eng': 'Engineering', 'engineer': 'Engineering',
+      'engineering dept': 'Engineering', 'software engineering': 'Engineering', 'software': 'Engineering',
+      'development': 'Engineering', 'dev': 'Engineering', 'engineering and development': 'Engineering',
+      'backend': 'Engineering', 'frontend': 'Engineering', 'infrastructure': 'Engineering', 'platform': 'Engineering',
+      // Operations
+      'operations': 'Operations', 'ops': 'Operations', 'operation': 'Operations', 'operational': 'Operations',
+      'operations dept': 'Operations', 'op': 'Operations', 'operations and logistics': 'Operations',
+      // Customer Support
+      'support': 'Customer Support', 'customer support': 'Customer Support', 'customer service': 'Customer Support',
+      'helpdesk': 'Customer Support', 'help desk': 'Customer Support', 'support dept': 'Customer Support',
+      'service': 'Customer Support', 'customer care': 'Customer Support', 'client services': 'Customer Support',
+      'crm': 'Customer Support',
+      // Legal
+      'legal': 'Legal', 'law': 'Legal', 'legal dept': 'Legal', 'compliance': 'Legal',
+      // Research & Development
+      'rd': 'Research & Development', 'r&d': 'Research & Development', 'r and d': 'Research & Development',
+      'research': 'Research & Development', 'research and development': 'Research & Development',
+      'research & development': 'Research & Development', 'product development': 'Research & Development',
+      'product': 'Research & Development', 'innovation': 'Research & Development',
+      // Administration
+      'admin': 'Administration', 'administration': 'Administration', 'administrative': 'Administration',
+      'management': 'Administration', 'executive': 'Administration', 'executives': 'Administration',
+      'office': 'Administration', 'office management': 'Administration', 'general management': 'Administration',
+      'administration dept': 'Administration', 'facilities': 'Administration',
+      // Logistics
+      'logistics': 'Logistics', 'supply chain': 'Logistics', 'procurement': 'Logistics',
+      'warehouse': 'Logistics', 'shipping': 'Logistics', 'purchasing': 'Logistics', 'stores': 'Logistics',
+      // Design
+      'design': 'Design', 'designer': 'Design', 'product design': 'Design', 'ui ux': 'Design',
+      'ui': 'Design', 'ux': 'Design', 'creative': 'Design', 'graphics': 'Design', 'graphic design': 'Design',
+      // Quality
+      'quality': 'Quality', 'qa': 'Quality', 'quality assurance': 'Quality', 'quality control': 'Quality',
+      'qc': 'Quality', 'testing': 'Quality', 'test': 'Quality',
+      // Data
+      'data': 'Data', 'data science': 'Data', 'analytics': 'Data', 'data analytics': 'Data',
+      'business intelligence': 'Data', 'bi': 'Data', 'data analysis': 'Data', 'data engineering': 'Data',
+      'data scientist': 'Data',
+    },
+    educationlevel: {
+      // High School
+      'high school': 'High School', 'highschool': 'High School', 'hs': 'High School',
+      'secondary': 'High School', 'higher secondary': 'High School', 'intermediate': 'High School',
+      'inter': 'High School', 'hsc': 'High School', 'ssc': 'High School', 'matric': 'High School',
+      'metric': 'High School', '12th': 'High School', '10th': 'High School', 'school': 'High School',
+      'secondary school': 'High School', 'fsc': 'High School', 'fa': 'High School', 'class 12': 'High School',
+      // Diploma
+      'diploma': 'Diploma', 'diplomas': 'Diploma', 'dip': 'Diploma',
+      'certificate': 'Diploma', 'cert': 'Diploma', 'technical diploma': 'Diploma',
+      'vocational': 'Diploma', 'associate': 'Diploma', 'associate degree': 'Diploma',
+      // Bachelors
+      'bachelors': 'Bachelors', "bachelor's": 'Bachelors', 'bachelor': 'Bachelors', "bachelor's degree": 'Bachelors',
+      'bachelors degree': 'Bachelors', 'bsc': 'Bachelors', 'b.s': 'Bachelors', 'b.s.': 'Bachelors',
+      'bs': 'Bachelors', 'ba': 'Bachelors', 'b.a': 'Bachelors', 'b.a.': 'Bachelors',
+      'b.sc': 'Bachelors', 'b.sc.': 'Bachelors', 'undergraduate': 'Bachelors',
+      'bcs': 'Bachelors', 'bcom': 'Bachelors', 'b.com': 'Bachelors', 'bscs': 'Bachelors', 'bs cs': 'Bachelors',
+      'baccalaureate': 'Bachelors', 'degree': 'Bachelors',
+      'bba': 'Bachelors', 'btech': 'Bachelors', 'b.tech': 'Bachelors', 'b.e': 'Bachelors', 'be': 'Bachelors',
+      'llb': 'Bachelors', 'bpharm': 'Bachelors', 'bsn': 'Bachelors', 'bscn': 'Bachelors',
+      // Masters
+      'masters': 'Masters', "master's": 'Masters', 'master': 'Masters', "master's degree": 'Masters',
+      'masters degree': 'Masters', 'msc': 'Masters', 'm.s': 'Masters', 'm.s.': 'Masters',
+      'ms': 'Masters', 'mba': 'Masters', 'm.a': 'Masters', 'm.a.': 'Masters', 'm.sc': 'Masters', 'm.sc.': 'Masters',
+      'postgraduate': 'Masters', 'pg': 'Masters', 'mcom': 'Masters', 'm.com': 'Masters',
+      'mphil': 'Masters', 'm.phil': 'Masters', 'mtech': 'Masters', 'm.tech': 'Masters',
+      'mfin': 'Masters', 'msf': 'Masters', 'llm': 'Masters', 'mpharm': 'Masters',
+      'grad': 'Masters', 'graduate': 'Masters',
+      // PhD
+      'phd': 'PhD', 'ph.d': 'PhD', 'ph.d.': 'PhD', 'doctorate': 'PhD', 'doctoral': 'PhD',
+      'doctor': 'PhD', 'doctor of philosophy': 'PhD', 'dphil': 'PhD', 'd.phil': 'PhD',
+      // Some College
+      'some college': 'Some College', 'some university': 'Some College', 'college': 'Some College',
+      'incomplete college': 'Some College', 'some': 'Some College',
+    },
+    employmenttype: {
+      'full time': 'Full-Time', 'full-time': 'Full-Time', 'fulltime': 'Full-Time', 'ft': 'Full-Time',
+      'part time': 'Part-Time', 'part-time': 'Part-Time', 'parttime': 'Part-Time', 'pt': 'Part-Time',
+      'contract': 'Contract', 'contractor': 'Contract', 'contractual': 'Contract', 'contract work': 'Contract',
+      'permanent': 'Permanent', 'perm': 'Permanent', 'permanent full time': 'Permanent', 'permanent employment': 'Permanent',
+      'temporary': 'Temporary', 'temp': 'Temporary', 'temporary worker': 'Temporary', 'temporary employment': 'Temporary',
+      'intern': 'Internship', 'internship': 'Internship', 'internee': 'Internship', 'trainee': 'Internship', 'interns': 'Internship',
+      'freelance': 'Freelance', 'freelancer': 'Freelance', 'self employed': 'Freelance', 'self-employed': 'Freelance',
+      'seasonal': 'Seasonal', 'seasonal worker': 'Seasonal',
+      'consultant': 'Consultant', 'consulting': 'Consultant',
+      'on call': 'On-Call', 'on-call': 'On-Call', 'oncall': 'On-Call',
+      'casual': 'Casual', 'casual worker': 'Casual', 'hourly': 'Casual',
     },
   }
 
@@ -1144,10 +1532,17 @@ app.post('/api/datasets/:id/clean', async (c) => {
     return Object.keys(SEMANTIC_MAPS).find(k => h.includes(k)) || null
   }
 
+  // Precompute normalized alias indexes ONCE per semantic column, then reuse
+  // for every cell (exact + fuzzy typo matching).
+  const semanticIndexes: Record<string, Map<string, string>> = {}
+  for (const key of Object.keys(SEMANTIC_MAPS)) {
+    semanticIndexes[key] = buildCategoryIndex(SEMANTIC_MAPS[key])
+  }
+
   // Collect non-null samples per column for heuristics (100 samples for accuracy)
   const samples = headers.map((_: string, ci: number) =>
     cleanedRows.map(r => r[ci])
-      .filter(v => v !== null && v !== undefined && String(v).trim() !== '')
+      .filter(v => !isMissingValue(v))
       .slice(0, 100)
   )
 
@@ -1159,14 +1554,23 @@ app.post('/api/datasets/:id/clean', async (c) => {
     const colInfo = columnAnalysis[ci] || { dataType: 'categorical' }
     const samp = samples[ci]
     const isId = isIdCol(hdr)
+    const isEmail = !isId && isEmailCol(hdr)
+    const isPhone = !isId && isPhoneCol(hdr)
+    // Data-based identifier: >95% unique values (Email, Phone, EmployeeID,
+    // FullName, …) even when the header doesn't look like one.
+    const isDataId = !isId && !isEmail && !isPhone && !!(colInfo.isIdentifier)
     return {
       isId,
+      isEmail,
+      isPhone,
+      // Unique identifier fields (id/email/phone/>95% unique) — missing values
+      // get a UNIQUE per-row placeholder, never a shared constant.
+      isUnique: isId || isEmail || isPhone || isDataId,
       // Also use upload-detected dataType so columns detected as date/bool at parse time are ALWAYS normalised
       isDate:     !isId && (isDateCol(hdr) || colInfo.dataType === 'date'),
       isBool:     !isId && (isBoolCol(hdr, samp) || colInfo.dataType === 'boolean'),
-      isEmail:    !isId && isEmailCol(hdr),
       isNum:      !isId && (colInfo.dataType === 'numerical' || isNumericByName(hdr)),
-      isText:     !isId && isTextCat(hdr, colInfo),
+      isText:     !isId && !isEmail && !isPhone && isTextCat(hdr, colInfo),
       semanticKey: !isId ? getSemanticMapKey(hdr) : null,
     }
   })
@@ -1178,6 +1582,18 @@ app.post('/api/datasets/:id/clean', async (c) => {
   let numericFormatFixed = 0
   let semanticMapped = 0
 
+  // Records every categorical merge (semantic expansion + variant
+  // consolidation) so the UI can show "merged 3 variants into 'Finance'".
+  const mergeRecords = new Map<number, Map<string, { variants: Set<string>; count: number }>>()
+  const recordMerge = (ci: number, from: string, to: string) => {
+    let colRec = mergeRecords.get(ci)
+    if (!colRec) { colRec = new Map<string, { variants: Set<string>; count: number }>(); mergeRecords.set(ci, colRec) }
+    let rec = colRec.get(to)
+    if (!rec) { rec = { variants: new Set<string>(), count: 0 }; colRec.set(to, rec) }
+    rec.variants.add(from)
+    rec.count++
+  }
+
   // Per-column parsing/validation/imputation stats (for debugging)
   const colStats: { parsedOk: number; parseFailed: number; outOfRange: number; imputed: number }[] =
     headers.map(() => ({ parsedOk: 0, parseFailed: 0, outOfRange: 0, imputed: 0 }))
@@ -1188,10 +1604,31 @@ app.post('/api/datasets/:id/clean', async (c) => {
   // range-violations (-5, 150) and missing values.
   const numericPools: number[][] = headers.map(() => [])
 
+  // Column-aware date contexts: collect every unambiguous date already present
+  // in each date column, plus day-first / month-first format votes. Ambiguous
+  // values ("05/01/2024") are then resolved to whichever interpretation the
+  // column actually uses — fixing mixed-format duplicates instead of guessing.
+  const dateContexts = headers.map((_: string, ci: number) => {
+    if (!colPlan[ci].isDate) return null
+    const knownDates = new Set<string>()
+    let dayVotes = 0, monthVotes = 0
+    cleanedRows.forEach(row => {
+      const v = row[ci]
+      if (v === null || v === undefined || String(v).trim() === '') return
+      const p = parseDateStruct(String(v).trim())
+      if (!p || p.ambiguous) return
+      knownDates.add(p.canonical as string)
+      if (p.dayFirstCanon && !p.monthFirstCanon) dayVotes++
+      else if (p.monthFirstCanon && !p.dayFirstCanon) monthVotes++
+    })
+    return { knownDates, dayVotes, monthVotes }
+  })
+
   cleanedRows = cleanedRows.map((row: any[]) => {
     return row.map((v: any, ci: number) => {
-      // Always skip null/empty — they are handled in imputation
-      if (v === null || v === undefined || String(v).trim() === '') return v
+      // Treat ALL missing sentinels (null, '', N/A, NaN, -, unknown, ...) as
+      // null — they are handled in imputation (STEP 6).
+      if (isMissingValue(v)) return null
 
       const p = colPlan[ci]
 
@@ -1201,9 +1638,11 @@ app.post('/api/datasets/:id/clean', async (c) => {
       let val = String(v).trim()
 
       // Date normalisation — unparseable → null so imputation fills with valid YYYY-MM-DD
-      // This is DETERMINISTIC: parseDate always runs, result never depends on LLM output
+      // This is DETERMINISTIC: parseDate always runs, result never depends on LLM output.
+      // The column context resolves ambiguous "05/01/2024" to 2024-01-05 (not 2024-05-01)
+      // when 2024-01-05 already exists in the same column.
       if (p.isDate) {
-        const d = parseDate(val)
+        const d = parseDate(val, dateContexts[ci] || undefined)
         if (d) { dateNormalized++; return d }
         return null // nullify so Step 6 imputes a valid date → 100% column consistency
       }
@@ -1241,15 +1680,22 @@ app.post('/api/datasets/:id/clean', async (c) => {
         return null
       }
 
-      // Semantic synonym mapping (PaymentMethod, Country, Gender, etc.)
+      // Semantic synonym mapping + fuzzy spelling normalization
+      // (PaymentMethod, Country, Gender, Department, EducationLevel, etc.)
       if (p.semanticKey) {
-        const map = SEMANTIC_MAPS[p.semanticKey]
-        const canonical = map[val.toLowerCase()]
-        if (canonical) { if (canonical !== val) semanticMapped++; return canonical }
+        const canonical = matchCategory(val, semanticIndexes[p.semanticKey])
+        if (canonical !== null) {
+          if (canonical !== val) {
+            recordMerge(ci, val, canonical)
+            semanticMapped++
+          }
+          return canonical
+        }
       }
 
-      // Categorical text — title-case normalisation (NEVER returns null)
-      if (p.isText && val.length < 100) {
+      // Text/categorical — title-case normalisation (NEVER returns null).
+      // Skip URLs so "https://..." isn't mangled to "Https://...".
+      if (p.isText && val.length < 100 && !/^[a-z][a-z0-9+.-]*:\/\//i.test(val)) {
         const tc = toTitleCase(val)
         if (tc !== val) caseNormalized++
         return tc
@@ -1268,26 +1714,353 @@ app.post('/api/datasets/:id/clean', async (c) => {
   )
 
   // ─────────────────────────────────────────────────────────────
-  // STEP 4 — Per-column RANGE VALIDATION (clamp / null invalid)
+  // STEP 3a — Categorical variant consolidation.
+  //
+  // Two passes:
+  //   A) Group spellings that only differ in punctuation/case/separators:
+  //      "Full-Time" vs "Full Time" vs "fulltime" (same stripped key).
+  //      Canonical = most frequent raw spelling in the group.
+  //   B) Merge groups across prefix abbreviations / initialisms / typos:
+  //      "Fin"→"Finance", "Mgr"→"Manager", "IT"→"Information Technology".
+  //      RULES (all bounds-checked, never merge short words):
+  //        • prefix rule: A is a prefix of B (len(A) ≥ 4) — B is a word
+  //          with a word boundary, so no merging of Mary/Maryland-style
+  //          accidental matches
+  //        • initialism: A is the letter-initials of the words in B
+  //          (len(A) ≥ 2) — "IT" → "Information Technology"
+  //        • typo: Levenshtein distance ≤ 2, both sides ≥ 4 chars
+  // ONLY applied to low-cardinality category columns (high-cardinality text
+  // like names/comments is never merged).
+  // ─────────────────────────────────────────────────────────────
+  let categoryVariantsMerged = 0
+  headers.forEach((hdr: string, ci: number) => {
+    if (!colPlan[ci].isText) return
+
+    const values = cleanedRows
+      .map((r: any[]) => r[ci])
+      .filter((v: any) => !isMissingValue(v))
+    if (values.length < 2) return
+
+    const distinctLower = new Set(values.map(v => String(v).toLowerCase().trim()))
+    const uniqueRatio = distinctLower.size / values.length
+    if (uniqueRatio > 0.5) return // high-cardinality → skip
+
+    // ---- Pass A: group raw spellings by stripped key -----------------
+    const groups = new Map<string, Map<string, number>>()
+    values.forEach(v => {
+      const k = normalizeKey(String(v))
+      if (!k) return
+      let g = groups.get(k)
+      if (!g) { g = new Map<string, number>(); groups.set(k, g) }
+      const raw = String(v).trim()
+      g.set(raw, (g.get(raw) || 0) + 1)
+    })
+
+    const remap = new Map<string, string>()     // raw spelling → canonical
+    const finalGroups: Array<{ canonical: string; members: string[] }> = []
+
+    for (const g of groups.values()) {
+      if (g.size <= 1) continue
+      let best = '', bestN = -1
+      for (const [raw, n] of g) if (n > bestN) { best = raw; bestN = n }
+      for (const raw of g.keys()) if (raw !== best) remap.set(raw, best)
+    }
+    // Recompute values after pass A (canonical labels + remaining singles)
+    const aVals = values.map(v => {
+      const s = String(v).trim()
+      return remap.get(s) || s
+    })
+    const aFreq = new Map<string, number>()
+    aVals.forEach(v => aFreq.set(v, (aFreq.get(v) || 0) + 1))
+    const aCanonical = new Set(aFreq.keys())
+
+    // ---- Pass B: cross-group merge ------------------------------------
+    const initialsOf = (s: string) =>
+      s.split(/\s+/).map(w => w[0] && w[0].toLowerCase()).join('')
+
+    const bKeys = [...aCanonical].sort((x, y) => x.length - y.length)
+    for (let i = 0; i < bKeys.length; i++) {
+      const a = bKeys[i], al = a.toLowerCase()
+      if (al.length < 4) continue
+      for (let j = i + 1; j < bKeys.length; j++) {
+        const b = bKeys[j], bl = b.toLowerCase()
+        if (bl.length < 4) continue
+        const ka = normalizeKey(a), kb = normalizeKey(b)
+        if (!ka || !kb || ka === kb) continue
+        let related = false
+        // Truncation / abbreviation: "Tech" ← "Technology", "Mktg" ← "Marketing"
+        // (normalizeKey strips separators so "U.S." == "US")
+        if (ka.length < kb.length && kb.startsWith(ka)) {
+          related = true
+        } else if (ka.length === kb.length && levenshtein(ka, kb) <= 1) {
+          related = true // pure separator/case variant ("US" vs "U.S."→same key; "Mgr" vs "Mngr" typo)
+        } else {
+          const ia = initialsOf(b)
+          if (ia === ka && ka.length >= 2) related = true          // "IT" ← "Information Technology"
+          // Typo rule: distance ≤ 2, both ≥ 4 chars, and NEITHER word is a
+          // substring of the other. "Marketting"←"Marketing" yes; "male"↔
+          // "female" no (female literally contains male — a genuine
+          // category, not a typo). Same guard applies to the prefix rule.
+          else if (levenshtein(ka, kb) <= 2 && ka.length >= 4 &&
+                   !kb.includes(ka) && !ka.includes(kb)) related = true
+        }
+        if (related) {
+          // smaller/canonical = the group with MORE total rows
+          const na = aFreq.get(a) || 0, nb = aFreq.get(b) || 0
+          const [keep, drop] = na >= nb ? [a, b] : [b, a]
+          finalGroups.push({ canonical: keep, members: [drop] })
+        }
+      }
+    }
+    // Apply canonical renames (canonical is always the more frequent label)
+    const bRemap = new Map<string, string>()
+    finalGroups.forEach(fg => fg.members.forEach(m => bRemap.set(m, fg.canonical)))
+
+    cleanedRows.forEach((row: any[]) => {
+      const v = row[ci]
+      if (v === null || v === undefined || isMissingValue(v)) return
+      const s = String(v).trim()
+      const viaA = remap.get(s)
+      const target = viaA ? bRemap.get(viaA) || viaA : bRemap.get(s) || s
+      if (target !== s) {
+        recordMerge(ci, s, target)
+        row[ci] = target
+        categoryVariantsMerged++
+      }
+    })
+  })
+
+  // ─────────────────────────────────────────────────────────────
+  // STEP 3b — Identifier-keyed duplicate MERGE.
+  //
+  // Byte-identical rows are easy to dedupe, but real-world duplicates rarely
+  // match exactly: the same entity appears twice with a different date format
+  // ("05/01/2024" vs "2024-01-05"), an outlier price (999999 vs 29.99), a
+  // precision typo (12.999 vs 12.99), or a missing cell ("not available").
+  // When the dataset has a natural key column (OrderID, EmployeeID,
+  // CustomerID, Email, …) we group rows by that key and merge the rows that
+  // clearly describe the SAME record (high field similarity). Per column the
+  // merge picks the BEST value from the whole group, so:
+  //   • a domain-valid value beats a range-violating outlier (-89.99, 999999)
+  //   • a precision-conformant value beats an extra-decimal one (12.999 → 12.99)
+  //   • a non-missing value beats a missing one ("not available" → 2024-01-13)
+  // This runs BEFORE imputation so sibling values are still intact to borrow.
+  // ─────────────────────────────────────────────────────────────
+  let duplicatesMerged = 0
+  let valuesRecovered = 0
+  {
+    // Primary key: prefer a header that is literally an id/code/uuid
+    // (OrderID, EmployeeID, CustomerID) — NEVER a data-derived identifier like
+    // Email when a real id column exists, otherwise one customer's many orders
+    // (same email, different OrderIDs) could be wrongly merged into one.
+    const idLike = (hdr: string) => /\bid\b|\bcode\b|\buuid\b/i.test(toWords(hdr))
+    let keyCol = -1
+    for (let ci = 0; ci < headers.length; ci++) {
+      if (colPlan[ci].isUnique && idLike(headers[ci])) { keyCol = ci; break }
+    }
+    if (keyCol === -1) {
+      for (let ci = 0; ci < headers.length; ci++) {
+        if (colPlan[ci].isUnique) { keyCol = ci; break }
+      }
+    }
+
+    if (keyCol !== -1) {
+      // Per-column IQR bounds & dominant decimal precision — used to pick the
+      // most plausible value when the duplicate rows disagree on a cell.
+      const iqrInfo = headers.map((hdr: string, ci: number) => {
+        if (!colPlan[ci].isNum) return null
+        const nums = numericPools[ci].filter(v => isFinite(v))
+        if (nums.length < 4) return null
+        const sorted = [...nums].sort((a, b) => a - b)
+        const q1 = sorted[Math.floor(sorted.length * 0.25)]
+        const q3 = sorted[Math.floor(sorted.length * 0.75)]
+        const iqr = q3 - q1
+        if (iqr === 0) return null
+        return { lower: q1 - 1.5 * iqr, upper: q3 + 1.5 * iqr }
+      })
+      const precInfo = headers.map((hdr: string, ci: number) => {
+        if (!colPlan[ci].isNum) return null
+        const counts = new Map<number, number>()
+        for (const n of numericPools[ci]) {
+          if (!isFinite(n)) continue
+          const d = decimalPlaces(n)
+          counts.set(d, (counts.get(d) || 0) + 1)
+        }
+        let dominant = 0, bestN = -1
+        for (const [d, c] of counts) if (c > bestN) { dominant = d; bestN = c }
+        return dominant
+      })
+
+      // How compatible are two rows? Missing cells never count as a conflict,
+      // so a sparse copy of the same record still scores high — but genuinely
+      // different records sharing a key disagree on several fields and stay put.
+      const similarity = (a: any[], b: any[]) => {
+        let agree = 0, compared = 0
+        for (let ci = 0; ci < headers.length; ci++) {
+          if (ci === keyCol) continue
+          const av = a[ci], bv = b[ci]
+          const aMiss = isMissingValue(av), bMiss = isMissingValue(bv)
+          if (aMiss && bMiss) { agree++; compared++; continue }
+          if (aMiss || bMiss) { agree++; compared++; continue }
+          compared++
+          if (String(av).toLowerCase().trim() === String(bv).toLowerCase().trim()) agree++
+        }
+        return compared === 0 ? 0 : agree / compared
+      }
+
+      // Pick the most plausible value for one column from a duplicate group:
+      // domain-valid → not-an-IQR-outlier → precision-conformant → most
+      // frequent → canonical row's spelling.
+      const pickBestValue = (cands: any[], ci: number, canonVal: any): any => {
+        const uniq = new Set(cands.map(v => String(v).toLowerCase().trim()))
+        if (uniq.size === 1) return cands[0]
+        let pool = cands
+        if (colPlan[ci].isNum) {
+          const rule = getDomainRule(headers[ci])
+          const inDomain = pool.filter(v => {
+            const n = Number(v)
+            return isNaN(n) || !rule || (n >= rule.min && n <= rule.max)
+          })
+          if (inDomain.length) pool = inDomain
+          const iqr = iqrInfo[ci]
+          if (iqr) {
+            const noOutlier = pool.filter(v => {
+              const n = Number(v)
+              return isNaN(n) || (n >= iqr.lower && n <= iqr.upper)
+            })
+            if (noOutlier.length) pool = noOutlier
+          }
+          const prec = precInfo[ci]
+          if (prec !== null && prec > 0) {
+            const conformant = pool.filter(v => {
+              const n = Number(v)
+              return isNaN(n) || decimalPlaces(n) <= prec
+            })
+            if (conformant.length) pool = conformant
+          }
+        }
+        const freq = new Map<string, number>()
+        for (const v of pool) {
+          const s = String(v).toLowerCase().trim()
+          freq.set(s, (freq.get(s) || 0) + 1)
+        }
+        let best = '', bestN = -1
+        for (const [s, n] of freq) if (n > bestN) { best = s; bestN = n }
+        const bestCands = pool.filter(v => String(v).toLowerCase().trim() === best)
+        return bestCands.find(v => String(v) === String(canonVal)) ?? bestCands[0]
+      }
+
+      // Group rows by the key value, then merge similar rows within each group.
+      const groups = new Map<string, any[][]>()
+      cleanedRows.forEach((row: any[]) => {
+        const kv = row[keyCol]
+        if (kv === null || kv === undefined || isMissingValue(kv)) return
+        const key = String(kv).toLowerCase().trim()
+        if (!key) return
+        if (!groups.has(key)) groups.set(key, [])
+        groups.get(key)!.push(row)
+      })
+
+      const replacement = new Map<any[], any[]>()  // first row of a cluster → merged row
+      const dropRows = new Set<any[]>()            // absorbed duplicate rows → removed
+      for (const [key, group] of groups) {
+        if (group.length < 2) continue
+        // Greedy single-linkage clustering by similarity. Three identical rows
+        // form one cluster (2 removed); genuinely different records sharing a
+        // key fall into their own size-1 clusters and are all kept as-is.
+        const used = new Array<boolean>(group.length).fill(false)
+        const clusters: any[][][] = []
+        for (let i = 0; i < group.length; i++) {
+          if (used[i]) continue
+          const cluster = [group[i]]
+          used[i] = true
+          for (let j = i + 1; j < group.length; j++) {
+            if (used[j]) continue
+            if (cluster.some(member => similarity(member, group[j]))) {
+              cluster.push(group[j])
+              used[j] = true
+            }
+          }
+          clusters.push(cluster)
+        }
+        const mergedRows = clusters.map(cl => {
+          if (cl.length === 1) return cl[0]
+          for (let r = 1; r < cl.length; r++) dropRows.add(cl[r])
+          const merged: any[] = []
+          for (let ci = 0; ci < headers.length; ci++) {
+            if (ci === keyCol) { merged.push(cl[0][keyCol]); continue }
+            const cands = cl.map(r => r[ci]).filter(v => !isMissingValue(v))
+            merged.push(cands.length ? pickBestValue(cands, ci, cl[0][ci]) : null)
+          }
+          // Count cells the merge repaired relative to the representative row:
+          // a cell that was missing or disagreed and now holds a clean value.
+          for (let ci = 0; ci < headers.length; ci++) {
+            if (ci === keyCol) continue
+            const before = cl[0][ci]
+            const after = merged[ci]
+            if (isMissingValue(before) && !isMissingValue(after)) valuesRecovered++
+            else if (!isMissingValue(before) && !isMissingValue(after) &&
+                     String(before).toLowerCase().trim() !== String(after).toLowerCase().trim()) valuesRecovered++
+          }
+          return merged
+        })
+        replacement.set(group[0], mergedRows[0])
+        duplicatesMerged += group.length - mergedRows.length
+      }
+
+      // Rebuild rows in original order: cluster representatives are replaced
+      // by their merged row, absorbed duplicates are dropped, everything else
+      // passes through untouched.
+      if (dropRows.size > 0) {
+        cleanedRows = cleanedRows
+          .filter(row => !dropRows.has(row))
+          .map(row => replacement.get(row) || row)
+      }
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // STEP 3c — Deduplicate BEFORE imputation.
+  //
+  // CRITICAL: if dedup ran after imputation, rows that are true exact
+  // duplicates (identical in every field, both originally missing the
+  // phone/email) would get DIFFERENT unique placeholders (unknown-1 vs
+  // unknown-2) and would no longer match — so duplicates were leaking
+  // through. Running dedup on the normalised-but-unimputed rows fixes this.
+  // ─────────────────────────────────────────────────────────────
+  // Missing sentinels all map to one marker so "N/A" == "" == null == NaN
+  // still count as a match (a row missing the same field twice is a dup).
+  const dedupKey = (row: any[]) =>
+    row.map(v => isMissingValue(v) ? '\u0000__missing__' : String(v).toLowerCase().trim()).join('|')
+
+  let duplicatesRemoved = 0
+  {
+    const seenRows = new Set<string>()
+    const deduped: any[][] = []
+    cleanedRows.forEach((row: any[]) => {
+      const key = dedupKey(row)
+      if (!seenRows.has(key)) { seenRows.add(key); deduped.push(row) }
+    })
+    duplicatesRemoved += cleanedRows.length - deduped.length
+    cleanedRows = deduped
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // STEP 4 — Per-column RANGE VALIDATION (clamp / null invalid).
+  // Uses the module-level configurable DOMAIN_RULES matched by header ROLE
+  // keyword — never by a specific column name.
   // ─────────────────────────────────────────────────────────────
   let rangeViolationsFixed = 0
 
-  const RANGE_RULES: Record<string, { min: number; max: number }> = {
-    age:       { min: 0,   max: 120 },
-    rating:    { min: 1,   max: 5   },
-    discount:  { min: 0,   max: 100 },
-    quantity:  { min: 1,   max: 999 },
-    price:     { min: 0,   max: Infinity },
-    salary:    { min: 0,   max: Infinity },
-    score:     { min: 0,   max: 100 },
-  }
-
   headers.forEach((hdr: string, ci: number) => {
-    const key = Object.keys(RANGE_RULES).find(k => hdr.toLowerCase().includes(k))
-    if (!key) return
-    const { min, max } = RANGE_RULES[key]
+    const rule = getDomainRule(hdr)
+    if (!rule) return
+    const { min, max } = rule
 
     cleanedRows.forEach((row: any[]) => {
+      // Skip missing cells — Number(null)/Number('') both coerce to 0 and
+      // would be miscounted as out-of-range (e.g. age 0 rule).
+      if (row[ci] === null || row[ci] === undefined || row[ci] === '') return
       const n = Number(row[ci])
       if (!isNaN(n)) {
         if (n < min || n > max) {
@@ -1300,17 +2073,26 @@ app.post('/api/datasets/:id/clean', async (c) => {
   })
 
   // ─────────────────────────────────────────────────────────────
-  // STEP 5 — Compute imputation values (median for numeric,
-  //          mode for categorical) on already-normalised data
+  // STEP 5 — Compute imputation values, TYPE-AWARE:
+  //   • numerical  → median (robust to outliers)
+  //   • date       → leave as missing (no date has a sensible "average")
+  //   • bool       → 'No'
+  //   • identifier → leave as missing (filled with per-row placeholder in
+  //                  STEP 6 — a shared constant would create dup keys)
+  //   • categorical low-cardinality → mode
+  //   • text / high-cardinality → leave as missing
+  // A null imputeVal means STEP 6 leaves the cell alone (row stays missing).
   // ─────────────────────────────────────────────────────────────
   const imputeVals = headers.map((_: string, ci: number) => {
     const colInfo = columnAnalysis[ci] || { dataType: 'categorical' }
     const vals = cleanedRows
       .map((r: any[]) => r[ci])
-      .filter((v: any) => v !== null && v !== undefined && v !== '' &&
-        String(v).toLowerCase() !== 'null' && String(v).toLowerCase() !== 'nan')
+      .filter((v: any) => !isMissingValue(v))
 
-    if (colInfo.dataType === 'numerical') {
+    if (colPlan[ci].isUnique) return null          // identifier → skip (placeholder)
+    if (colInfo.dataType === 'date') return null   // never impute dates
+
+    if (colInfo.dataType === 'numerical' || colPlan[ci].isNum) {
       const nums = numericPools[ci]
       if (nums.length === 0) return 0
       const sorted = [...nums].sort((a: number, b: number) => a - b)
@@ -1320,7 +2102,12 @@ app.post('/api/datasets/:id/clean', async (c) => {
         : sorted[mid]
     }
     if (colPlan[ci].isBool) return 'No'
-    if (vals.length === 0) return 'Unknown'
+
+    // Categorical: only impute low-cardinality (high-cardinality text like
+    // FullName/comments has no meaningful mode)
+    if (vals.length === 0) return null
+    const distinct = new Set(vals.map(String))
+    if (distinct.size / vals.length > 0.5) return null
     const freq = new Map<string, number>()
     vals.forEach((v: any) => {
       const s = String(v).trim()
@@ -1335,14 +2122,31 @@ app.post('/api/datasets/:id/clean', async (c) => {
   // STEP 6 — Apply imputation (only touch null values)
   // ─────────────────────────────────────────────────────────────
   let missingValuesImputed = 0
+  let uniquePlaceholders = 0
+  const uniqueCounter: number[] = headers.map(() => 0)
 
   cleanedRows.forEach((row: any[]) => {
     row.forEach((v: any, ci: number) => {
-      if (v === null || v === undefined || v === '' ||
-          String(v).toLowerCase() === 'null' || String(v).toLowerCase() === 'nan') {
-        row[ci] = imputeVals[ci]
-        missingValuesImputed++
-        colStats[ci].imputed++
+      if (isMissingValue(v)) {
+        // Unique identifier fields (id/email/phone) must NEVER get a shared
+        // constant — that creates duplicate keys. Give each row its OWN
+        // placeholder (unknown-1@placeholder.invalid, unknown-2, ...) so
+        // uniqueness is preserved across the whole column.
+        if (colPlan[ci].isUnique) {
+          uniqueCounter[ci]++
+          uniquePlaceholders++
+          row[ci] = colPlan[ci].isEmail
+            ? `unknown-${uniqueCounter[ci]}@placeholder.invalid`
+            : `unknown-${uniqueCounter[ci]}`
+          missingValuesImputed++
+          colStats[ci].imputed++
+        } else if (imputeVals[ci] !== null && imputeVals[ci] !== undefined) {
+          row[ci] = imputeVals[ci]
+          missingValuesImputed++
+          colStats[ci].imputed++
+        }
+        // else: leave genuinely missing (dates, high-cardinality text) —
+        //       honest imputation beats fabricating a value
       }
     })
   })
@@ -1353,19 +2157,11 @@ app.post('/api/datasets/:id/clean', async (c) => {
   // ─────────────────────────────────────────────────────────────
   let outliersCapped = 0
 
-  // Columns where IQR outlier capping is meaningless because the
-  // column is discrete/bounded (e.g. small-integer ratings, quantities)
-  const BOUNDED_COLUMNS = new Set(['quantity', 'rating', 'discount', 'score'])
-
   headers.forEach((hdr: string, ci: number) => {
     // Use colPlan (which merges upload-detected type + name-based heuristics)
     // rather than raw columnAnalysis.dataType — otherwise columns like
     // "Price" that looked like text ($1,492.50) would skip IQR entirely.
     if (!colPlan[ci].isNum) return
-
-    // Skip discrete/bounded columns — IQR capping is only meaningful
-    // for continuous unbounded columns like Price, Age, Salary
-    if (BOUNDED_COLUMNS.has(hdr.toLowerCase())) return
 
     const numVals = cleanedRows.map((r: any[]) => Number(r[ci])).filter((n: number) => !isNaN(n))
     if (numVals.length < 4) return
@@ -1401,6 +2197,44 @@ app.post('/api/datasets/:id/clean', async (c) => {
   })
 
   // ─────────────────────────────────────────────────────────────
+  // STEP 7b — Decimal precision normalisation.
+  // Values with MORE decimals than the column's dominant precision are almost
+  // always data-entry noise — "12.999" in a 2-decimal price column is a typo
+  // for 12.99. Truncate them to the dominant precision so the column is
+  // internally consistent (integer columns are left untouched).
+  // ─────────────────────────────────────────────────────────────
+  let precisionNormalized = 0
+  headers.forEach((hdr: string, ci: number) => {
+    if (!colPlan[ci].isNum) return
+    const vals = cleanedRows.map(r => Number(r[ci])).filter(v => !isNaN(v) && isFinite(v))
+    if (vals.length === 0) return
+    const counts = new Map<number, number>()
+    let hasFractional = false
+    for (const n of vals) {
+      const d = decimalPlaces(n)
+      if (d > 0) hasFractional = true
+      counts.set(d, (counts.get(d) || 0) + 1)
+    }
+    let target = 0, bestN = -1
+    for (const [d, c] of counts) if (c > bestN) { target = d; bestN = c }
+    // Money columns (price/amount/cost/…) default to 2 decimals (cents) as
+    // long as the column contains any fractional value — 12.999 → 12.99.
+    if (target < 2 && hasFractional && isNumericByName(hdr)) target = 2
+    if (target === 0) return
+    const factor = Math.pow(10, target)
+    cleanedRows.forEach(row => {
+      const v = row[ci]
+      if (v === null || v === undefined || isMissingValue(v)) return
+      const n = Number(v)
+      if (isNaN(n) || !isFinite(n)) return
+      if (decimalPlaces(n) > target) {
+        row[ci] = Math.trunc(n * factor) / factor
+        precisionNormalized++
+      }
+    })
+  })
+
+  // ─────────────────────────────────────────────────────────────
   // SAFETY: detect any *numerical* column that collapsed to a
   // single value (categorical columns can legitimately be uniform)
   // ─────────────────────────────────────────────────────────────
@@ -1425,25 +2259,46 @@ app.post('/api/datasets/:id/clean', async (c) => {
   })
 
   // ─────────────────────────────────────────────────────────────
-  // STEP 8 — Deduplicate (exact + case-insensitive near-dups)
+  // STEP 8 — Post-imputation dedup safety net.
+  // Primary dedup already ran in STEP 3b (before imputation). This catches
+  // rows that only became identical AFTER imputation (e.g. one row missing a
+  // categorical value and another already holding the mode → both now equal).
+  // Unique placeholders differ per row so they never trip this pass.
   // ─────────────────────────────────────────────────────────────
-  const seenRows = new Set<string>()
-  const deduped: any[][] = []
-  cleanedRows.forEach((row: any[]) => {
-    const key = row.map(v => String(v ?? '').toLowerCase().trim()).join('|')
-    if (!seenRows.has(key)) { seenRows.add(key); deduped.push(row) }
-  })
-  const duplicatesRemoved = (rows.length - blankRowsRemoved) - deduped.length
-  cleanedRows = deduped
+  {
+    const seenRows = new Set<string>()
+    const deduped: any[][] = []
+    cleanedRows.forEach((row: any[]) => {
+      const key = dedupKey(row)
+      if (!seenRows.has(key)) { seenRows.add(key); deduped.push(row) }
+    })
+    duplicatesRemoved += cleanedRows.length - deduped.length
+    cleanedRows = deduped
+  }
 
   // ─────────────────────────────────────────────────────────────
   // STEP 9 — Recalculate column analysis & quality score
   // ─────────────────────────────────────────────────────────────
+  const preCleanUnique = headers.map((_: string, idx: number) =>
+    (columnAnalysis[idx] || {}).uniqueValues || 0
+  )
+
   const updatedColumnAnalysis = headers.map((header: string, idx: number) => {
     const values = cleanedRows.map((r: any[]) => r[idx])
-    const nonNull = values.filter((v: any) => v !== null && v !== undefined && v !== '')
+    const nonNull = values.filter((v: any) => !isMissingValue(v))
     const uniqueValues = new Set(nonNull.map(String)).size
     const nullCount = values.length - nonNull.length
+    const nonNullCount = nonNull.length
+    // Identifier stays flagged post-clean (a filled placeholder column is
+    // still unique) so the quality score keeps checking it.
+    const isIdentifier = (columnAnalysis[idx] || {}).isIdentifier === true
+    const freq = new Map<string, number>()
+    nonNull.forEach((v: any) => {
+      const s = String(v).toLowerCase().trim()
+      freq.set(s, (freq.get(s) || 0) + 1)
+    })
+    let duplicateValues = 0
+    for (const n of freq.values()) if (n > 1) duplicateValues += (n - 1)
     return {
       name: header,
       index: idx,
@@ -1451,6 +2306,9 @@ app.post('/api/datasets/:id/clean', async (c) => {
       uniqueValues,
       nullCount,
       nullPercent: Math.round((nullCount / values.length) * 10000) / 100,
+      nonNullCount,
+      isIdentifier,
+      duplicateValues,
       sampleValues: nonNull.slice(0, 5).map(String)
     }
   })
@@ -1463,7 +2321,9 @@ app.post('/api/datasets/:id/clean', async (c) => {
       updatedNumericalStats[col.name] = calculateStats(values)
     })
 
-  const updatedQualityScore = getDataQualityScore(cleanedRows, headers)
+  // Honest post-clean score: missing + duplicate identifiers + category
+  // growth + domain outliers. Only 100% when every check genuinely passes.
+  const updatedQualityScore = computeDataQualityScore(cleanedRows, headers, updatedColumnAnalysis, preCleanUnique)
 
   // ─────────────────────────────────────────────────────────────
   // STEP 10 — Persist updated dataset
@@ -1479,7 +2339,12 @@ app.post('/api/datasets/:id/clean', async (c) => {
     duplicatePercent: 0,
     isCleaned: true,
     cleaningSummary: {
-      duplicatesRemoved: duplicatesRemoved < 0 ? 0 : duplicatesRemoved,
+      // duplicatesRemoved = exact-duplicate rows dropped + identifier-keyed
+      // duplicate groups merged (both reduce row count).
+      duplicatesRemoved: (duplicatesRemoved + duplicatesMerged) < 0 ? 0 : duplicatesRemoved + duplicatesMerged,
+      duplicatesMerged,
+      valuesRecovered,
+      precisionNormalized,
       blankRowsRemoved,
       missingValuesImputed,
       outliersCapped,
@@ -1489,6 +2354,17 @@ app.post('/api/datasets/:id/clean', async (c) => {
       boolNormalized,
       numericFormatFixed,
       emailsInvalidated,
+      uniquePlaceholders,
+      categoryVariantsMerged,
+      // Report of every categorical merge: { column, canonical, variants, rowsAffected }
+      categoryMerges: [...mergeRecords.entries()].map(([ci, recs]) => ({
+        column: headers[ci] || `Column ${ci + 1}`,
+        merges: [...recs.entries()].map(([to, rec]) => ({
+          canonical: to,
+          variants: [...rec.variants],
+          rowsAffected: rec.count
+        }))
+      })).filter(m => m.merges.length > 0),
     }
   }
 
@@ -1499,6 +2375,10 @@ app.post('/api/datasets/:id/clean', async (c) => {
     ...updatedDataset,
     preview: cleanedRows.slice(0, 50)
   })
+  } catch (err: any) {
+    console.error('Clean failed:', err)
+    return c.json({ error: `Cleaning failed: ${err?.message || err}` }, 500)
+  }
 })
 
 // Download Cleaned CSV
@@ -1602,6 +2482,7 @@ function generateMainHTML(): string {
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.29/jspdf.plugin.autotable.min.js"></script>
     <link rel="stylesheet" href="/styles.css">
+    <link rel="icon" type="image/png" href="/ai-data-scientist-logo-banner.png">
 </head>
 <body class="bg-dark-950 text-white font-['Inter'] antialiased overflow-x-hidden">
     <div id="app"></div>
@@ -1972,7 +2853,14 @@ const App = {
       this.state.dataset = data
       this.state.loading = false
       this.render()
-      this.showToast('Dataset fully cleaned! All detectable issues resolved.', 'success')
+      // Honest success message: 100% only when every check really passes
+      const remainingMissing = (data.columnAnalysis || []).reduce((sum, c) => sum + (c.nullCount || 0), 0)
+      const remainingDupId = (data.columnAnalysis || []).reduce((sum, c) => sum + (c.duplicateValues || 0), 0)
+      if (remainingMissing === 0 && remainingDupId === 0) {
+        this.showToast('Dataset fully cleaned! All detectable issues resolved.', 'success')
+      } else {
+        this.showToast('Cleaned, but ' + remainingMissing + ' missing value(s) and ' + remainingDupId + ' duplicate identifier value(s) remain — quality score is not 100%.', 'warning')
+      }
       
       // Auto-reload dependencies
       this.loadEDA()
@@ -2024,9 +2912,12 @@ const App = {
       doc.text('Data Quality Score: ' + d.qualityScore + '%', 15, 78)
       
       if (d.isCleaned) {
+        const remainingMissing = (d.columnAnalysis || []).reduce((sum, c) => sum + (c.nullCount || 0), 0)
+        const remainingDupId = (d.columnAnalysis || []).reduce((sum, c) => sum + (c.duplicateValues || 0), 0)
+        const allClean = remainingMissing === 0 && remainingDupId === 0
         doc.setFont('helvetica', 'bold')
-        doc.setTextColor(16, 185, 129)
-        doc.text('Status: 100% CLEANED & RESOLVED', 15, 87)
+        doc.setTextColor(allClean ? 16 : 245, allClean ? 185 : 158, allClean ? 129 : 11)
+        doc.text('Status: ' + (allClean ? '100% CLEANED & RESOLVED' : 'CLEANED — ' + remainingMissing + ' MISSING + ' + remainingDupId + ' DUP IDENTIFIER VALUE(S) REMAIN'), 15, 87)
         doc.setFont('helvetica', 'normal')
         doc.setFontSize(9)
         doc.text('- Duplicates Removed: ' + (d.cleaningSummary?.duplicatesRemoved || 0), 20, 93)
@@ -2242,15 +3133,7 @@ const App = {
       
       <!-- Header -->
       <header class="relative z-10 flex items-center justify-between px-4 md:px-8 py-3 md:py-5 glass border-b border-white/5">
-        <div class="flex items-center gap-2 md:gap-3 min-w-0">
-          <div class="w-8 md:w-10 h-8 md:h-10 rounded-xl bg-gradient-to-br from-primary-500 to-purple-600 flex items-center justify-center flex-shrink-0">
-            <i class="fas fa-brain text-white text-sm md:text-lg"></i>
-          </div>
-          <div class="min-w-0">
-            <h1 class="text-sm md:text-xl font-bold text-white truncate">AI Data Scientist</h1>
-            <p class="text-[10px] md:text-xs text-dark-400 truncate">Intelligent Analysis Platform</p>
-          </div>
-        </div>
+        <img src="/ai-data-scientist-logo-banner.png" alt="AI Data Scientist" class="h-10 md:h-12 w-auto rounded-lg">
         <div class="flex items-center gap-2 md:gap-4 flex-shrink-0">
           <span class="px-2 md:px-3 py-0.5 md:py-1 rounded-full text-[10px] md:text-xs font-medium bg-green-500/10 text-green-400 border border-green-500/20 whitespace-nowrap">
             <i class="fas fa-circle text-[4px] md:text-[6px] mr-1 md:mr-1.5 animate-pulse"></i>Online
@@ -2356,15 +3239,7 @@ const App = {
       <!-- Sidebar -->
       <aside class="sidebar w-64 h-screen glass border-r border-white/5 flex-col overflow-y-auto \${this.state.sidebarOpen ? 'fixed left-0 top-0 z-[60] flex' : 'hidden'} md:fixed md:flex md:z-40">
         <div class="p-5 border-b border-white/5 flex items-center justify-between">
-          <div class="flex items-center gap-3">
-            <div class="w-9 h-9 rounded-lg bg-gradient-to-br from-primary-500 to-purple-600 flex items-center justify-center">
-              <i class="fas fa-brain text-white text-sm"></i>
-            </div>
-            <div>
-              <h1 class="text-sm font-bold text-white">AI Data Scientist</h1>
-              <p class="text-[10px] text-dark-500">v1.0.0</p>
-            </div>
-          </div>
+          <img src="/ai-data-scientist-logo-banner.png" alt="AI Data Scientist" class="w-40 h-auto rounded-lg">
           <button onclick="App.toggleSidebar(event)" class="md:hidden w-8 h-8 rounded-lg glass-light flex items-center justify-center hover:bg-white/10 active:scale-95 transition-transform text-white relative z-50 flex-shrink-0">
             <i class="fas fa-xmark"></i>
           </button>
@@ -2403,12 +3278,7 @@ const App = {
             <button onclick="App.toggleSidebar(event)" class="w-9 h-9 rounded-lg glass-light flex items-center justify-center hover:bg-white/10 active:scale-95 transition-transform text-white flex-shrink-0">
               <i class="fas fa-bars"></i>
             </button>
-            <div class="flex items-center gap-2 min-w-0">
-              <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-primary-500 to-purple-600 flex items-center justify-center flex-shrink-0">
-                <i class="fas fa-brain text-white text-[10px]"></i>
-              </div>
-              <span class="text-sm font-bold text-white truncate">AI Data Scientist</span>
-            </div>
+            <img src="/ai-data-scientist-logo-banner.png" alt="AI Data Scientist" class="h-9 w-auto rounded flex-shrink-0">
           </div>
           <div class="flex items-center gap-2 flex-shrink-0">
             <span class="text-[10px] px-2.5 py-0.5 rounded-full bg-green-500/10 text-green-400 border border-green-500/20">Online</span>
@@ -2918,26 +3788,56 @@ const App = {
     if (!cl || !d) return '<div class="flex items-center justify-center h-64"><div class="loading-spinner"></div></div>'
     
     const cs = d.cleaningSummary || {}
+    // Honest post-clean status: remaining missing cells / duplicate
+    // identifier values mean the score is NOT 100%, and we say so.
+    const remainingMissing = d.columnAnalysis ? d.columnAnalysis.reduce((sum, c) => sum + (c.nullCount || 0), 0) : 0
+    const remainingDupId = d.columnAnalysis ? d.columnAnalysis.reduce((sum, c) => sum + (c.duplicateValues || 0), 0) : 0
+    const allClean = remainingMissing === 0 && remainingDupId === 0
     const cleanedBanner = d.isCleaned ?
-      '<div class="bg-green-500/10 border border-green-500/20 text-green-400 rounded-xl p-5 mb-6">' +
-        '<div class="flex items-start gap-3 mb-4">' +
-          '<i class="fas fa-circle-check text-xl mt-0.5"></i>' +
-          '<div>' +
-            '<h4 class="font-bold text-sm text-white">Dataset Fully Cleaned!</h4>' +
-            '<p class="text-xs text-green-400/80 mt-0.5">Production-grade pipeline applied — all detectable issues resolved.</p>' +
-          '</div>' +
-        '</div>' +
-        '<div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px]">' +
-          '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.duplicatesRemoved || 0) + '</div><div class="text-dark-400">Duplicates Removed</div></div>' +
-          '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.blankRowsRemoved || 0) + '</div><div class="text-dark-400">Blank Rows Dropped</div></div>' +
-          '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.missingValuesImputed || 0) + '</div><div class="text-dark-400">Missing Imputed</div></div>' +
-          '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.rangeViolationsFixed || 0) + '</div><div class="text-dark-400">Range Violations Fixed</div></div>' +
-          '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.caseNormalized || 0) + '</div><div class="text-dark-400">Text Case Normalised</div></div>' +
-          '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.dateNormalized || 0) + '</div><div class="text-dark-400">Dates Standardised</div></div>' +
-          '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.boolNormalized || 0) + '</div><div class="text-dark-400">Booleans Normalised</div></div>' +
-          '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + ((cs.numericFormatFixed || 0) + (cs.outliersCapped || 0)) + '</div><div class="text-dark-400">Numeric Issues Fixed</div></div>' +
-        '</div>' +
-      '</div>'
+      (allClean ?
+       '<div class="bg-green-500/10 border border-green-500/20 text-green-400 rounded-xl p-5 mb-6">' +
+         '<div class="flex items-start gap-3 mb-4">' +
+           '<i class="fas fa-circle-check text-xl mt-0.5"></i>' +
+           '<div>' +
+             '<h4 class="font-bold text-sm text-white">Dataset Fully Cleaned!</h4>' +
+             '<p class="text-xs text-green-400/80 mt-0.5">All detectable issues resolved — no remaining missing values or duplicate identifiers.</p>' +
+           '</div>' +
+         '</div>' +
+         '<div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px]">' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.duplicatesRemoved || 0) + '</div><div class="text-dark-400">Duplicates Removed</div></div>' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.duplicatesMerged || 0) + '</div><div class="text-dark-400">Duplicate Groups Merged</div></div>' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.valuesRecovered || 0) + '</div><div class="text-dark-400">Values Recovered</div></div>' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.blankRowsRemoved || 0) + '</div><div class="text-dark-400">Blank Rows Dropped</div></div>' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.missingValuesImputed || 0) + '</div><div class="text-dark-400">Missing Imputed</div></div>' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.rangeViolationsFixed || 0) + '</div><div class="text-dark-400">Range Violations Fixed</div></div>' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.caseNormalized || 0) + '</div><div class="text-dark-400">Text Case Normalised</div></div>' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.dateNormalized || 0) + '</div><div class="text-dark-400">Dates Standardised</div></div>' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.boolNormalized || 0) + '</div><div class="text-dark-400">Booleans Normalised</div></div>' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + ((cs.numericFormatFixed || 0) + (cs.outliersCapped || 0) + (cs.precisionNormalized || 0)) + '</div><div class="text-dark-400">Numeric Issues Fixed</div></div>' +
+         '</div>' +
+       '</div>'
+       :
+       '<div class="bg-amber-500/10 border border-amber-500/20 text-amber-400 rounded-xl p-5 mb-6">' +
+         '<div class="flex items-start gap-3 mb-4">' +
+           '<i class="fas fa-triangle-exclamation text-xl mt-0.5"></i>' +
+           '<div>' +
+             '<h4 class="font-bold text-sm text-white">Cleaned, with remaining gaps</h4>' +
+             '<p class="text-xs text-amber-400/80 mt-0.5">' + remainingMissing + ' missing value(s) and ' + remainingDupId + ' duplicate identifier value(s) remain — the quality score reflects this honestly.</p>' +
+           '</div>' +
+         '</div>' +
+         '<div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px]">' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.duplicatesRemoved || 0) + '</div><div class="text-dark-400">Duplicates Removed</div></div>' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.duplicatesMerged || 0) + '</div><div class="text-dark-400">Duplicate Groups Merged</div></div>' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.valuesRecovered || 0) + '</div><div class="text-dark-400">Values Recovered</div></div>' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.blankRowsRemoved || 0) + '</div><div class="text-dark-400">Blank Rows Dropped</div></div>' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.missingValuesImputed || 0) + '</div><div class="text-dark-400">Missing Imputed</div></div>' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.rangeViolationsFixed || 0) + '</div><div class="text-dark-400">Range Violations Fixed</div></div>' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.caseNormalized || 0) + '</div><div class="text-dark-400">Text Case Normalised</div></div>' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.dateNormalized || 0) + '</div><div class="text-dark-400">Dates Standardised</div></div>' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + (cs.boolNormalized || 0) + '</div><div class="text-dark-400">Booleans Normalised</div></div>' +
+           '<div class="bg-white/5 rounded-lg px-3 py-2"><div class="font-bold text-white text-sm">' + ((cs.numericFormatFixed || 0) + (cs.outliersCapped || 0) + (cs.precisionNormalized || 0)) + '</div><div class="text-dark-400">Numeric Issues Fixed</div></div>' +
+         '</div>' +
+       '</div>')
      : ''
 
     return \`
@@ -2991,6 +3891,7 @@ const App = {
                 '<i class="fas ' +
                   (s.type === 'missing_values' ? 'fa-circle-question' :
                    s.type === 'duplicates' ? 'fa-copy' :
+                   s.type === 'duplicate_identifiers' ? 'fa-key' :
                    s.type === 'outliers' ? 'fa-chart-line' : 'fa-triangle-exclamation') +
                   ' text-sm ' +
                   (s.severity === 'high' ? 'text-red-400' : s.severity === 'medium' ? 'text-amber-400' : 'text-blue-400') +
@@ -3011,6 +3912,34 @@ const App = {
           '</div>'
         ).join('')}
       </div>
+      
+      <!-- Category Merges (after cleaning) -->
+      \${cs.categoryMerges && cs.categoryMerges.length > 0 ? 
+        '<div class="glass-card rounded-xl p-5 mt-6">' +
+          '<div class="flex items-center gap-2 mb-4">' +
+            '<i class="fas fa-object-ungroup text-primary-400"></i>' +
+            '<h3 class="text-base font-semibold text-white">Category Standardization</h3>' +
+          '</div>' +
+          '<div class="space-y-4">' +
+            cs.categoryMerges.map((m) =>
+              '<div>' +
+                '<div class="text-xs font-semibold text-dark-300 uppercase tracking-wide mb-2">' + m.column + '</div>' +
+                '<div class="space-y-1.5">' +
+                  m.merges.map((r) =>
+                    '<div class="flex flex-wrap items-center gap-1.5 text-xs bg-white/5 rounded-lg px-3 py-2">' +
+                      '<span class="text-white font-medium">' + r.canonical + '</span>' +
+                      '<span class="text-dark-400"><i class="fas fa-arrow-right text-[10px]"></i></span>' +
+                      '<span class="text-dark-300">merged from</span>' +
+                      r.variants.map((v) => '<span class="px-1.5 py-0.5 rounded bg-dark-700 text-dark-300">' + v + '</span>').join('') +
+                      '<span class="ml-auto text-dark-400">' + r.rowsAffected + ' row(s)</span>' +
+                    '</div>'
+                  ).join('') +
+                '</div>' +
+              '</div>'
+            ).join('') +
+          '</div>' +
+        '</div>'
+       : ''}
     </div>\`
   },
 
@@ -3092,9 +4021,7 @@ const App = {
       <!-- Chat Header -->
       <div class="glass-card rounded-2xl px-4 md:px-6 py-3 md:py-4 mb-4 flex items-center justify-between flex-shrink-0 gap-2 border border-primary-500/10">
         <div class="flex items-center gap-2 md:gap-3 min-w-0">
-          <div class="w-8 md:w-10 h-8 md:h-10 rounded-xl bg-gradient-to-br from-primary-500 to-purple-600 flex items-center justify-center shadow-lg shadow-primary-500/20 flex-shrink-0">
-            <i class="fas fa-robot text-white text-xs md:text-sm"></i>
-          </div>
+          <img src="/ai-data-scientist-logo-banner.png" alt="AI Data Scientist" class="h-8 md:h-11 w-auto rounded-lg flex-shrink-0">
           <div class="min-w-0">
             <h2 class="text-sm md:text-base font-bold text-white truncate">AI Data Scientist</h2>
             <div class="flex items-center gap-1.5">
@@ -3112,9 +4039,7 @@ const App = {
       <div id="chat-messages" class="flex-1 overflow-y-auto space-y-5 pr-1 pb-2" style="scroll-behavior:smooth">
         \${msgs.length === 0 ? \`
           <div class="flex flex-col items-center justify-center h-full text-center px-4 py-16">
-            <div class="w-20 h-20 rounded-3xl bg-gradient-to-br from-primary-500/15 to-purple-600/15 flex items-center justify-center mb-5 border border-primary-500/10">
-              <i class="fas fa-brain text-3xl text-primary-400"></i>
-            </div>
+            <img src="/ai-data-scientist-logo-banner.png" alt="AI Data Scientist" class="w-28 h-auto rounded-2xl mb-5 border border-primary-500/10">
             <h3 class="text-xl font-bold text-white mb-2">Ask anything about your data</h3>
             <p class="text-sm text-dark-400 mb-8 max-w-sm">I can uncover trends, explain patterns, summarize statistics, and much more.</p>
             <div class="grid grid-cols-1 md:grid-cols-2 gap-2 w-full max-w-lg">
@@ -3136,8 +4061,8 @@ const App = {
             return \`
             <div class="flex \${isUser ? 'justify-end' : 'justify-start'} items-end gap-2.5">
               \${!isUser ? \`
-                <div class="w-8 h-8 rounded-xl bg-gradient-to-br from-primary-500 to-purple-600 flex items-center justify-center flex-shrink-0 shadow-lg">
-                  <i class="fas fa-robot text-white text-xs"></i>
+                <div class="w-8 h-8 rounded-xl overflow-hidden flex-shrink-0 shadow-lg">
+                  <img src="/ai-data-scientist-logo-banner.png" alt="AI" class="w-full h-full object-cover">
                 </div>
               \` : ''}
               <div class="max-w-[78%] \${isUser
@@ -3159,8 +4084,8 @@ const App = {
           }).join('')}
           \${this.state.chatLoading ? \`
             <div class="flex justify-start items-end gap-2.5">
-              <div class="w-8 h-8 rounded-xl bg-gradient-to-br from-primary-500 to-purple-600 flex items-center justify-center flex-shrink-0 shadow-lg">
-                <i class="fas fa-robot text-white text-xs"></i>
+              <div class="w-8 h-8 rounded-xl overflow-hidden flex-shrink-0 shadow-lg">
+                <img src="/ai-data-scientist-logo-banner.png" alt="AI" class="w-full h-full object-cover">
               </div>
               <div class="glass-card rounded-2xl rounded-bl-sm px-4 py-3 border border-white/5">
                 <div class="flex gap-1.5 items-center h-5">

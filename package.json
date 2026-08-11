@@ -4,7 +4,7 @@
   "description": "AI-powered data science platform that automates complete data analysis workflows",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "npm run build && wrangler pages dev dist --ip 0.0.0.0 --port 3000",
     "build": "vite build",
     "preview": "wrangler pages dev dist --ip 0.0.0.0 --port 3000",
     "deploy": "npm run build && wrangler pages deploy dist",

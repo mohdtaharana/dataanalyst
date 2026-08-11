@@ -13,6 +13,7 @@ try {
 
 export default defineConfig({
   plugins: [pages()],
+  publicDir: 'src/public',
   define: {
     __POOLSIDE_API_KEY__: JSON.stringify(localKey)
   },
